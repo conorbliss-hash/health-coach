@@ -704,7 +704,7 @@ function distributeReport(report, scores, weekly, trend, goals, warnings = [], d
 
   const blob = Utilities.newBlob(finalHtml, 'text/html', 'Weekly_Report.html');
   const pdf = blob.getAs('application/pdf');
-  const recipient = 'conor.bliss.henaghan@gmail.com';
+  const recipient = CONFIG.REPORT_RECIPIENT || 'your-email@example.com'; // Update with your email
   const emailPlanText = planNarrativeLine && planNarrativeLine.trim()
     ? planNarrativeLine.trim()
     : 'Your weekly performance report is attached.';
