@@ -1,0 +1,3650 @@
+// ==== Main.gs ====
+// Delta-first display, Purple capacity, stats moved to Appendix, missing days surfaced
+// NOTE: All constants are now in Constants.gs (CONFIG, COACH, schema, etc.)
+
+const COACH_VOICE = {
+  sleep: {
+    success: { directive: 'Maintain bedtime window 22:30–06:30.', check: 'Recheck in 7 days.' },
+    warning: { directive: 'Lock lights-out at 22:30; screens off by 21:30.', check: 'Recheck in 7 days.' },
+    danger: { directive: 'Fix lights-out 22:30 and anchor wake 06:30.', check: 'Recheck in 7 days.' },
+    neutral: { directive: 'Collect sleep data nightly.', check: 'Recheck in 7 days.' }
+  },
+  load: {
+    under: { directive: 'Add +8% volume; keep RPE ≤8.', check: 'Review Sunday.' },
+    inBand: { directive: 'Keep volume steady.', check: 'Next check in 48h.' },
+    overreach: { directive: 'Hold load flat; review fatigue notes nightly.', check: 'Review Friday.' },
+    highRisk: { directive: 'Deload 30% volume now; prioritise recovery.', check: 'Resume base Monday.' },
+    unknown: { directive: 'Collect load data before ramping.', check: 'Review next report.' }
+  },
+  cardio: {
+    success: { directive: 'Keep post-dinner walk 20 minutes.', check: 'Check totals Sunday.' },
+    warning: { directive: 'Walk 30 min after dinner today.', check: 'Hit floor on 5 of 7 days.' },
+    danger: { directive: 'Schedule two 30 min brisk walks tomorrow.', check: 'Audit steps in 48h.' },
+    neutral: { directive: 'Log daily steps to restore confidence.', check: 'Review Sunday.' }
+  },
+  work: {
+    success: { directive: 'Protect two daily focus blocks.', check: 'Check calendar Friday.' },
+    warning: { directive: 'Schedule two 120-min deep-work blocks now.', check: 'Confirm progress Thursday.' },
+    danger: { directive: 'Book focus blocks and clear distractions.', check: 'Review bandwidth mid-week.' },
+    neutral: { directive: 'Record work hours nightly.', check: 'Audit at week end.' }
+  }
+};
+
+const OBS_LABELS = {
+  success: 'Stable',
+  warning: 'Moderate deficit',
+  danger: 'Severe deficit',
+  neutral: 'Data gap'
+};
+
+/**
+ * Backwards-compatible entry point for manual runs in the Apps Script UI.
+ * Proxies to the full weekly job so choosing “main” still sends the report email.
+ */
+function loadSeverityKey_(label) {
+  if (!label) return 'unknown';
+  const map = {
+    'Under-stimulus': 'under',
+    'In band': 'inBand',
+    'Overreach': 'overreach',
+    'High risk': 'highRisk',
+    'Unknown': 'unknown'
+  };
+  return map[label] || 'unknown';
+}
+
+function extractJsonFromText_(rawText) {
+  if (!rawText) return '';
+  const trimmed = rawText.trim();
+  const fenced = trimmed.match(/```json([\s\S]*?)```/i) || trimmed.match(/```([\s\S]*?)```/i);
+  if (fenced && fenced[1]) {
+    return fenced[1].trim();
+  }
+  const firstBrace = trimmed.indexOf('{');
+  const lastBrace = trimmed.lastIndexOf('}');
+  if (firstBrace !== -1 && lastBrace !== -1 && lastBrace > firstBrace) {
+    return trimmed.slice(firstBrace, lastBrace + 1);
+  }
+  return trimmed;
+}
+
+function parseAiReportJson_(rawText) {
+  const jsonSnippet = extractJsonFromText_(rawText);
+  if (!jsonSnippet) {
+    return { ok: false, error: 'empty_response' };
+  }
+  try {
+    const parsed = JSON.parse(jsonSnippet);
+    return { ok: true, data: parsed };
+  } catch (err) {
+    return { ok: false, error: `parse_error: ${err.message}` };
+  }
+}
+
+function normalizeString_(value, maxChars) {
+  if (typeof value !== 'string') return '';
+  const trimmed = value.trim();
+  if (!maxChars) return trimmed;
+  if (trimmed.length <= maxChars) return trimmed;
+  return trimmed.slice(0, maxChars).trim();
+}
+
+function normalizeStringArray_(arr, maxItems, maxChars) {
+  if (!Array.isArray(arr)) return [];
+  const limited = typeof maxItems === 'number' ? arr.slice(0, maxItems) : arr.slice();
+  return limited
+    .map(item => normalizeString_(item, maxChars))
+    .filter(Boolean);
+}
+
+function countWords_(text) {
+  if (!text) return 0;
+  return text.trim().split(/\s+/).filter(Boolean).length;
+}
+
+function formatDateIso_(date) {
+  const d = new Date(date);
+  if (isNaN(d)) return '';
+  const year = d.getFullYear();
+  const month = String(d.getMonth() + 1).padStart(2, '0');
+  const day = String(d.getDate()).padStart(2, '0');
+  return `${year}-${month}-${day}`;
+}
+
+function computeIsoWeekNumber_(date) {
+  const target = new Date(date);
+  target.setHours(0, 0, 0, 0);
+  // Thursday in current week decides the year.
+  target.setDate(target.getDate() + 3 - ((target.getDay() + 6) % 7));
+  const firstThursday = new Date(target.getFullYear(), 0, 4);
+  firstThursday.setDate(firstThursday.getDate() + 3 - ((firstThursday.getDay() + 6) % 7));
+  const weekNumber = 1 + Math.round((target - firstThursday) / 604800000);
+  return weekNumber;
+}
+
+function getWeekMetadataForReport_() {
+  const bounds = typeof getWeekBounds_ === 'function' ? getWeekBounds_() : null;
+  const start = bounds ? new Date(bounds[0]) : new Date();
+  const end = bounds ? new Date(bounds[1]) : new Date(start.getTime() + 6 * 86400000);
+  start.setHours(0, 0, 0, 0);
+  end.setHours(23, 59, 59, 999);
+  const isoWeek = computeIsoWeekNumber_(start);
+  const label = `WEEK OF ${formatDateIso_(start)}`;
+  return {
+    start,
+    end,
+    isoWeek,
+    label,
+    isoLabel: `Week ${isoWeek}`
+  };
+}
+
+function validateReportSchema_(obj) {
+  const errors = [];
+  if (!obj || typeof obj !== 'object') {
+    return { ok: false, errors: ['root_not_object'] };
+  }
+
+  const metadata = obj.metadata && typeof obj.metadata === 'object' ? obj.metadata : {};
+  const version = normalizeString_(metadata.version || obj.version || '', 20);
+  const normalized = {
+    metadata: {
+      version: version || REPORT_SCHEMA_VERSION,
+      model: normalizeString_(metadata.model || '', 40)
+    }
+  };
+
+  // Insights
+  const insights = normalizeStringArray_(obj.insights, 3, BULLET_CHAR_LIMIT);
+  if (insights.length !== 3) {
+    errors.push('insights_length');
+  }
+  normalized.insights = insights;
+
+  // Sections
+  const sections = {};
+  if (!obj.sections || typeof obj.sections !== 'object') {
+    errors.push('sections_missing');
+  }
+  REPORT_SECTION_KEYS.forEach(key => {
+    const section = obj.sections && typeof obj.sections[key] === 'object' ? obj.sections[key] : {};
+    const title = normalizeString_(section.title, SECTION_TITLE_LIMIT);
+    if (!title) errors.push(`${key}_title_missing`);
+    const bullets = normalizeStringArray_(section.bullets, 4, BULLET_CHAR_LIMIT);
+    if (!bullets.length) errors.push(`${key}_bullets_missing`);
+    const notes = normalizeStringArray_(section.notes || [], 2, BULLET_CHAR_LIMIT);
+    sections[key] = { title, bullets, notes };
+  });
+  normalized.sections = sections;
+
+  // Recommendations
+  const recommendations = normalizeStringArray_(obj.recommendations, 5, RECOMMENDATION_CHAR_LIMIT);
+  if (recommendations.length < 4) {
+    errors.push('recommendations_insufficient');
+  }
+  const recsOverLimit = recommendations.some(rec => countWords_(rec) > RECOMMENDATION_WORD_LIMIT);
+  if (recsOverLimit) errors.push('recommendation_word_limit');
+  normalized.recommendations = recommendations;
+
+  // Decision
+  const decision = obj.decision && typeof obj.decision === 'object' ? obj.decision : {};
+  const plan = normalizeString_(decision.plan, 40);
+  const lever = normalizeString_(decision.lever, BULLET_CHAR_LIMIT);
+  if (!plan) errors.push('decision_plan_missing');
+  if (!lever) errors.push('decision_lever_missing');
+  normalized.decision = {
+    plan,
+    lever,
+    notes: normalizeStringArray_(decision.notes || [], 3, BULLET_CHAR_LIMIT)
+  };
+
+  const coachCall = normalizeString_(obj.coachCall || '', COACH_CALL_CHAR_LIMIT);
+  if (!coachCall) errors.push('coach_call_missing');
+  normalized.coachCall = coachCall;
+
+  normalized.warnings = normalizeStringArray_(obj.warnings || [], 4, BULLET_CHAR_LIMIT);
+  normalized.prose = normalizeString_(obj.prose || '', 2000);
+
+  const ok = errors.length === 0;
+  return { ok, report: normalized, errors };
+}
+
+function buildFallbackReport_(scores, derived, baselineSections, decision) {
+  const fulfil = derived?.fulfilment || {};
+  const sleepConsistency = derived?.sleep?.consistency || {};
+  const readinessDelta = derived?.rhr?.deltaTrendStr || '';
+
+  const fmtFul = pct => (pct == null ? 'no percent insight' : `${Math.round(pct)} percent`);
+
+  const insights = [
+    `Performance index sits at ${scores.activity}/100 with activity fulfilment ${fmtFul(fulfil.workPct)} and strength fulfilment ${fmtFul(fulfil.strengthPct)}.`,
+    `Sleep fulfilment is ${fmtFul(fulfil.sleepPct)}; consistency reads ${sleepConsistency.score != null ? `${sleepConsistency.score}/100 (${sleepConsistency.label || 'Data Gaps'})` : 'Data Gaps'}.`,
+    `Readiness trends ${fmtFul(fulfil.rhrPct)}; recommendation stays ${decision.plan} — ${decision.lever}.`
+  ];
+
+  const decisionNotes = decision?.notes || [];
+
+  return {
+    metadata: { version: REPORT_SCHEMA_VERSION, model: 'fallback' },
+    insights,
+    sections: {
+      activity: {
+        title: DEFAULT_ACTIVITY_TITLE,
+        bullets: baselineSections.activityBullets.slice(),
+        notes: []
+      },
+      recovery: {
+        title: DEFAULT_RECOVERY_TITLE,
+        bullets: baselineSections.recoveryBullets.slice(),
+        notes: []
+      },
+      readiness: {
+        title: DEFAULT_READINESS_TITLE,
+        bullets: baselineSections.readinessBullets.slice(),
+        notes: []
+      }
+    },
+    coachCall: baselineSections.coachCall || '',
+    recommendations: FALLBACK_RECOMMENDATIONS.slice(),
+    decision: {
+      plan: decision?.plan || 'Maintain',
+      lever: decision?.lever || 'Keep core habits steady',
+      notes: decisionNotes
+    },
+    warnings: derived?.warnings || [],
+    prose: ''
+  };
+}
+
+function mergeAiWithFallback_(aiReport, fallbackReport) {
+  if (!aiReport) {
+    return { report: fallbackReport, degraded: true, reason: 'parse_or_schema_fail' };
+  }
+
+  const merged = JSON.parse(JSON.stringify(fallbackReport));
+  merged.metadata = {
+    version: aiReport.metadata?.version || fallbackReport.metadata.version,
+    model: aiReport.metadata?.model || fallbackReport.metadata.model
+  };
+
+  if (Array.isArray(aiReport.insights) && aiReport.insights.length === 3) {
+    merged.insights = aiReport.insights.slice();
+  }
+
+  REPORT_SECTION_KEYS.forEach(key => {
+    const section = aiReport.sections?.[key];
+    if (!section) return;
+    if (section.title) merged.sections[key].title = section.title;
+    if (Array.isArray(section.bullets) && section.bullets.length) {
+      merged.sections[key].bullets = section.bullets.slice();
+    }
+    if (Array.isArray(section.notes) && section.notes.length) {
+      merged.sections[key].notes = section.notes.slice();
+    }
+  });
+
+  if (Array.isArray(aiReport.recommendations) && aiReport.recommendations.length) {
+    merged.recommendations = aiReport.recommendations.slice();
+  }
+
+  if (aiReport.decision) {
+    merged.decision = {
+      plan: aiReport.decision.plan || merged.decision.plan,
+      lever: aiReport.decision.lever || merged.decision.lever,
+      notes: Array.isArray(aiReport.decision.notes) && aiReport.decision.notes.length
+        ? aiReport.decision.notes.slice()
+        : merged.decision.notes
+    };
+  }
+
+  if (aiReport.coachCall) merged.coachCall = aiReport.coachCall;
+  if (Array.isArray(aiReport.warnings) && aiReport.warnings.length) {
+    merged.warnings = aiReport.warnings.slice();
+  }
+  if (aiReport.prose) merged.prose = aiReport.prose;
+
+  return { report: merged, degraded: false, reason: '' };
+}
+
+function escapeHtml_(value) {
+  if (value == null) return '';
+  return String(value)
+    .replace(/&/g, '&amp;')
+    .replace(/</g, '&lt;')
+    .replace(/>/g, '&gt;')
+    .replace(/"/g, '&quot;')
+    .replace(/'/g, '&#39;');
+}
+
+function sanitizeTextForHtml_(text, maxChars) {
+  if (text == null) return '';
+  let cleaned = String(text).replace(/\s+/g, ' ').trim();
+  cleaned = cleaned.replace(/\.{2,}/g, '.');
+  cleaned = cleaned.replace(/\s+,/g, ',');
+  cleaned = cleaned.replace(/\s+\./g, '.');
+  cleaned = cleaned.replace(/\s+;/g, ';');
+  if (maxChars && cleaned.length > maxChars) cleaned = cleaned.slice(0, maxChars).trim();
+  return escapeHtml_(cleaned);
+}
+
+function sanitizeArrayForHtml_(arr, maxChars) {
+  if (!Array.isArray(arr)) return [];
+  const seen = new Set();
+  const result = [];
+  arr.forEach(item => {
+    const sanitized = sanitizeTextForHtml_(item, maxChars);
+    if (sanitized && !seen.has(sanitized)) {
+      seen.add(sanitized);
+      result.push(sanitized);
+    }
+  });
+  return result;
+}
+
+function sanitizeCoachRead_(coachRead) {
+  if (!coachRead) return null;
+  const sanitizeList = list => sanitizeArrayForHtml_(list || [], 180);
+  return {
+    whereYoureAt: sanitizeList(coachRead.whereYoureAt),
+    nextOrders: sanitizeList(coachRead.nextOrders),
+    tradeOffs: sanitizeList(coachRead.tradeOffs),
+    gutChecks: sanitizeList(coachRead.gutChecks)
+  };
+}
+
+function sanitizeReportForHtml_(report) {
+  report = report || {};
+  const safe = {
+    metadata: Object.assign({}, report.metadata || {}),
+    insights: sanitizeArrayForHtml_(report.insights || [], BULLET_CHAR_LIMIT),
+    sections: {},
+    recommendations: sanitizeArrayForHtml_(report.recommendations || [], RECOMMENDATION_CHAR_LIMIT),
+    decision: {
+      plan: sanitizeTextForHtml_(report.decision?.plan || '', 40),
+      lever: sanitizeTextForHtml_(report.decision?.lever || '', BULLET_CHAR_LIMIT),
+      notes: sanitizeArrayForHtml_(report.decision?.notes || [], BULLET_CHAR_LIMIT)
+    },
+    coachCall: sanitizeTextForHtml_(report.coachCall || '', COACH_CALL_CHAR_LIMIT),
+    warnings: sanitizeArrayForHtml_(report.warnings || [], BULLET_CHAR_LIMIT),
+    prose: sanitizeTextForHtml_(report.prose || '', 2000)
+  };
+
+  safe.coachRead = sanitizeCoachRead_(report.coachRead);
+
+  REPORT_SECTION_KEYS.forEach(key => {
+    const section = report.sections?.[key] || {};
+    safe.sections[key] = {
+      title: sanitizeTextForHtml_(section.title || '', SECTION_TITLE_LIMIT),
+      bullets: sanitizeArrayForHtml_(section.bullets || [], BULLET_CHAR_LIMIT),
+      notes: sanitizeArrayForHtml_(section.notes || [], BULLET_CHAR_LIMIT)
+    };
+  });
+
+  return safe;
+}
+
+function parseSignedNumber_(text) {
+  if (text == null) return null;
+  const match = String(text).replace(/,/g, '').match(/-?\d+(\.\d+)?/);
+  return match ? Number(match[0]) : null;
+}
+
+function getStatusClass_(label) {
+  const value = (label || '').toLowerCase();
+  if (value.includes('disrupt') || value.includes('low')) return 'status-danger';
+  if (value.includes('drift') || value.includes('drift')) return 'status-warning';
+  if (value.includes('data gap')) return 'status-neutral';
+  if (value.includes('under') || value.includes('slack')) return 'status-purple';
+  return 'status-success';
+}
+
+function fmtDurationMinutes_(minutes, fallback = '—') {
+  if (minutes == null || isNaN(minutes)) return fallback;
+  const m = Math.round(minutes);
+  const h = Math.floor(m / 60);
+  const rem = m % 60;
+  if (!h) return `${rem}m`;
+  if (!rem) return `${h}h`;
+  return `${h}h ${rem}m`;
+}
+
+function fmtSteps_(steps) {
+  if (steps == null || isNaN(steps)) return '—';
+  const value = Number(steps);
+  if (value >= 1000) return `${(value / 1000).toFixed(1).replace(/\.0$/, '')}k`;
+  return `${Math.round(value)}`;
+}
+
+function fmtStepsDelta_(steps) {
+  if (steps == null || isNaN(steps)) return '0';
+  const thousands = steps / 1000;
+  if (Math.abs(thousands) >= 1) return `${Math.abs(thousands).toFixed(1).replace(/\.0$/, '')}k`;
+  return `${Math.round(Math.abs(steps))}`;
+}
+
+function fmtDeltaArrow_(current, baseline, formatter) {
+  return formatDeltaArrow(current, baseline, { formatter });
+}
+
+function formatOrDash_(value, formatter) {
+  if (value == null || value === '' || (typeof value === 'number' && !isFinite(value))) return '—';
+  return formatter ? formatter(value) : value;
+}
+
+function formatValue_(value, { units, decimals = 1 } = {}) {
+  if (value == null || !isFinite(value)) return '—';
+  switch (units) {
+    case 'minutes':
+      return fmtDurationMinutes_(value);
+    case 'hours':
+      return `${value.toFixed(decimals)}h`;
+    case 'kg':
+      return `${fmtInt(value)}kg`;
+    case 'steps':
+      return fmtSteps_(value);
+    case 'steps-diff':
+      return fmtStepsDelta_(value);
+    case 'bpm':
+      return fmtBpm(value);
+    case 'ratio':
+      return value.toFixed(decimals);
+    default:
+      return decimals != null ? value.toFixed(decimals) : String(value);
+  }
+}
+
+function formatDeltaArrow(current, baseline, options = {}) {
+  if (current == null || baseline == null || !isFinite(current) || !isFinite(baseline)) return '—';
+  const diff = current - baseline;
+  const tolerance = options.tolerance != null ? options.tolerance : 0.0001;
+  if (Math.abs(diff) < tolerance) return options.equalText || '→ 0';
+  const arrow = diff > 0 ? '↑' : '↓';
+  const sign = diff > 0 ? '+' : '-';
+  const magnitude = Math.abs(diff);
+  const formatted = options.formatter ? options.formatter(magnitude) : formatValue_(magnitude, options);
+  return `${arrow} ${sign}${formatted}`;
+}
+
+function clamp01_(value) {
+  if (value == null || !isFinite(value)) return null;
+  if (value <= 0) return 0;
+  if (value >= 1) return 1;
+  return value;
+}
+
+function pctOfGoal_(value, goal) {
+  if (value == null || goal == null || !isFinite(value) || !isFinite(goal) || goal === 0) return null;
+  return Math.max(0, Math.min(100, Math.round((value / goal) * 100)));
+}
+
+function pctOfGoal(value, goal) {
+  return pctOfGoal_(value, goal);
+}
+
+function pctVs4Week_(current, average) {
+  if (current == null || average == null || !isFinite(current) || !isFinite(average) || average === 0) return null;
+  return Math.round(((current - average) / Math.abs(average)) * 100);
+}
+
+function pctVs4w(current, fourWeek) {
+  return pctVs4Week_(current, fourWeek);
+}
+
+function formatPercentValue_(pct) {
+  if (pct == null || !isFinite(pct)) return '—';
+  const value = Math.round(pct);
+  return `${value}%`;
+}
+
+function formatPercentDelta_(pct) {
+  if (pct == null || !isFinite(pct)) return '—';
+  const value = Math.round(pct);
+  const sign = value > 0 ? '+' : '';
+  return `${sign}${value}%`;
+}
+
+function formatFloorCompliance_(actual, target) {
+  if (actual == null || target == null || !isFinite(actual) || !isFinite(target) || target <= 0) return '—';
+  const pct = Math.round((Math.max(0, Math.min(actual, target)) / target) * 100);
+  return `${Math.round(actual)}/${Math.round(target)} (${pct}%)`;
+}
+
+function formatPercentHeadline_(label, pct) {
+  if (pct == null || !isFinite(pct)) return '—';
+  return `${label} ${Math.round(pct)}%`;
+}
+
+function pctClamp_(value) {
+  if (value == null || !isFinite(value)) return null;
+  const clamped = Math.max(0, Math.min(100, Math.round(value)));
+  return clamped;
+}
+
+function pctOfGoalUnlimited_(value, goal) {
+  if (value == null || goal == null || !isFinite(value) || !isFinite(goal) || goal === 0) return null;
+  return Math.round((value / goal) * 100);
+}
+
+function normalizeObservationText_(text) {
+  return String(text || '')
+    .replace(/[↑↓→]\s*/g, '')
+    .replace(/\s+,/g, ',')
+    .replace(/,\s+/g, ', ')
+    .replace(/\s+/g, ' ')
+    .trim()
+    .replace(/,$/, '');
+}
+
+function ensureSentence_(text) {
+  const trimmed = String(text || '').trim();
+  if (!trimmed) return '';
+  return /[.!?]$/.test(trimmed) ? trimmed : `${trimmed}.`;
+}
+
+function composeCoachInsight_(observation, directive, check) {
+  const parts = [observation, directive, check]
+    .map(ensureSentence_)
+    .filter(Boolean);
+  return parts.join(' ');
+}
+
+function weightedAverage_(components = []) {
+  const usable = components.filter(([weight, value]) => weight && value != null && isFinite(value));
+  if (!usable.length) return null;
+  const weightSum = usable.reduce((sum, [weight]) => sum + weight, 0);
+  if (!weightSum) return null;
+  const total = usable.reduce((sum, [weight, value]) => sum + weight * value, 0);
+  return total / weightSum;
+}
+
+function describeTrendWord_(delta, { positiveIsGood = true, tolerance = 2, upWord = 'improving', downWord = 'sliding' } = {}) {
+  if (delta == null || !isFinite(delta) || Math.abs(delta) < tolerance) return 'stable';
+  const isIncrease = delta > 0;
+  const trendingPositive = positiveIsGood ? isIncrease : !isIncrease;
+  return trendingPositive ? upWord : downWord;
+}
+
+function recencyBlend4w_(values = [], weights = [0.4, 0.3, 0.2, 0.1]) {
+  if (!Array.isArray(values) || !values.length) return null;
+  const usable = values.filter(v => v != null && isFinite(v));
+  if (!usable.length) return null;
+  const applicableWeights = weights.slice(0, usable.length);
+  const weightSum = applicableWeights.reduce((sum, w) => sum + w, 0) || usable.length;
+  let total = 0;
+  usable.forEach((value, index) => {
+    const weight = applicableWeights[index] != null ? applicableWeights[index] : (weightSum / usable.length);
+    total += value * weight;
+  });
+  return total / weightSum;
+}
+
+function trendDelta_(current, previous) {
+  if (current == null || previous == null || !isFinite(current) || !isFinite(previous)) return null;
+  if (previous === 0) {
+    if (current === 0) return 0;
+    return current > 0 ? 100 : -100;
+  }
+  return ((current - previous) / Math.abs(previous)) * 100;
+}
+
+function mapRhrDeltaToPct_(rhrAvg, baseline) {
+  if (rhrAvg == null || baseline == null || !isFinite(rhrAvg) || !isFinite(baseline)) return null;
+  const delta = rhrAvg - baseline;
+  const score = 70 - 4 * delta;
+  return pctClamp_(score);
+}
+
+function mapSdToPct_(sdMinutes, target = 30) {
+  if (sdMinutes == null || !isFinite(sdMinutes)) return null;
+  const sd = Math.max(0, sdMinutes);
+  let score;
+  if (sd <= target) {
+    score = 90 + (target - sd) * 0.333;
+  } else {
+    score = 90 - (sd - target) * 0.5;
+  }
+  return pctClamp_(score);
+}
+
+function mapAcwrToPct_(acwr) {
+  if (acwr == null || !isFinite(acwr)) return null;
+  const deviation = Math.abs(acwr - 1.0);
+  const score = 100 - 120 * deviation;
+  return pctClamp_(score);
+}
+
+function formatTrendArrow_(trend) {
+  if (trend == null || !isFinite(trend)) return '→ 0%';
+  const rounded = Math.round(trend);
+  if (rounded === 0) return '→ 0%';
+  const arrow = rounded > 0 ? '↑' : '↓';
+  const sign = rounded > 0 ? '+' : '';
+  return `${arrow} ${sign}${rounded}%`;
+}
+
+function appendTrendCue_(text, trend) {
+  if (!text) return '';
+  if (trend == null || !isFinite(trend)) return text;
+  if (trend > 3) return `${text} (improving)`;
+  if (trend < -3) return `${text} (sliding)`;
+  return text;
+}
+
+function copyReadiness_(pct, trend) {
+  if (pct == null || !isFinite(pct)) return 'Readiness data missing — log recovery inputs.';
+  let base;
+  if (pct >= 85) base = 'Capacity high — ready to build.';
+  else if (pct >= 70) base = 'Moderate capacity — maintain rhythm.';
+  else base = 'Recovery limited — protect sleep.';
+  return appendTrendCue_(base, trend);
+}
+
+function copyOutput_(pct, trend) {
+  if (pct == null || !isFinite(pct)) return 'Output data missing — keep execution logs.';
+  let base;
+  if (pct >= 90) base = 'Strong execution.';
+  else if (pct >= 75) base = 'Below optimal stimulus.';
+  else base = 'Under-stimulus — raise base.';
+  return appendTrendCue_(base, trend);
+}
+
+function buildPlanSummaryText_(readinessPct, outputPct, readinessTrend, outputTrend, balance) {
+  let firstSentence = 'Take a breather, mate—output is outpacing recovery right now.';
+  if (balance != null && isFinite(balance)) {
+    if (balance >= 8) {
+      firstSentence = 'Take a breather, mate—recovery feels decent but keep the reins on anyway.';
+    } else if (balance <= -8) {
+      firstSentence = 'Take a breather, mate—body signals are shouting louder than your output.';
+    }
+  }
+
+  const trendR = readinessTrend != null && isFinite(readinessTrend) ? Math.round(readinessTrend) : null;
+  const trendO = outputTrend != null && isFinite(outputTrend) ? Math.round(outputTrend) : null;
+
+  let secondSentence = 'Both metrics were broadly stable this week.';
+  if (trendO != null && trendR != null) {
+    if (trendO >= 3 && trendR <= -3) {
+      secondSentence = 'Output kept climbing while readiness copped a knock.';
+    } else if (trendO <= -3 && trendR >= 3) {
+      secondSentence = 'Readiness perked up while output eased off a touch.';
+    } else if (trendO >= 3 && trendR >= 3) {
+      secondSentence = 'Both readiness and output lifted this week.';
+    } else if (trendO <= -3 && trendR <= -3) {
+      secondSentence = 'Both readiness and output softened this week.';
+    }
+  }
+
+  let thirdSentence = 'Dial back the hard stuff, stack easy movement, and guard your shut-eye.';
+  if (balance != null && isFinite(balance)) {
+    if (balance >= 8) {
+      thirdSentence = 'Keep things cruisy, focus on mobility, and let freshness build before the next push.';
+    } else if (balance <= -8) {
+      thirdSentence = 'Strip out heavy lifts, roll with low-key sessions, and make sleep non-negotiable tonight.';
+    }
+  }
+
+  return `${firstSentence} ${secondSentence} ${thirdSentence}`.trim();
+}
+
+function mapStatusClassToVoiceKey_(className) {
+  switch (className) {
+    case 'status-success':
+      return 'success';
+    case 'status-warning':
+      return 'warning';
+    case 'status-danger':
+      return 'danger';
+    case 'status-purple':
+      return 'warning';
+    case 'status-neutral':
+    default:
+      return 'neutral';
+  }
+}
+
+function mapBandToVoiceKey_(band) {
+  switch (band) {
+    case 'success':
+      return 'success';
+    case 'warning':
+      return 'warning';
+    case 'danger':
+      return 'danger';
+    default:
+      return 'neutral';
+  }
+}
+
+function buildObservationTag_(label, delta, positiveIsGood = true) {
+  const base = label || 'Data gap';
+  if (delta == null || !isFinite(delta) || Math.abs(delta) <= 1) return `${base} →`;
+  const arrow = delta > 0 ? '↑' : '↓';
+  if (!positiveIsGood) {
+    return `${base} ${arrow}`;
+  }
+  return `${base} ${arrow}`;
+}
+
+function lerp_(a, b, t) {
+  return a + (b - a) * t;
+}
+
+function computeConsistencyScore_(sdMinutes) {
+  if (sdMinutes == null || !isFinite(sdMinutes)) return null;
+  const sd = Math.max(0, sdMinutes);
+  if (sd <= 15) return 100;
+  if (sd <= 30) return Math.round(lerp_(85, 100, (30 - sd) / 15));
+  if (sd <= 45) return Math.round(lerp_(70, 85, (45 - sd) / 15));
+  if (sd <= 60) return Math.round(lerp_(50, 70, (60 - sd) / 15));
+  return 30;
+}
+
+function computeRhrScore_(deltaBpm) {
+  if (deltaBpm == null || !isFinite(deltaBpm)) return null;
+  const d = Math.abs(deltaBpm);
+  if (d <= 1) return 95;
+  if (d <= 3) return 85;
+  if (d <= 5) return 70;
+  if (d <= 8) return 50;
+  return 30;
+}
+
+function sleepBandLabel_(sdMinutes) {
+  if (typeof sleepBandLabelFromSd_ === 'function') {
+    return sleepBandLabelFromSd_(sdMinutes);
+  }
+  if (sdMinutes == null || !isFinite(sdMinutes)) return 'Data gap';
+  if (sdMinutes <= 15) return 'Elite';
+  if (sdMinutes <= 30) return 'Stable';
+  if (sdMinutes <= 45) return 'Drifting';
+  if (sdMinutes <= 60) return 'Irregular';
+  return 'Chaotic';
+}
+
+function loadSeverityLabel_(acwrValue, rhrDeltaValue) {
+  if (acwrValue == null || !isFinite(acwrValue)) return 'Unknown';
+  if (acwrValue < 0.85) return 'Under-stimulus';
+  if (acwrValue <= 1.15) return 'In band';
+  if (acwrValue < 1.30) return 'Overreach';
+  return (rhrDeltaValue != null && rhrDeltaValue > 0) ? 'High risk' : 'Overreach';
+}
+
+function mapAcwrToScore_(acwr) {
+  if (acwr == null || !isFinite(acwr)) return null;
+  if (acwr <= 0.7 || acwr >= 1.3) return 60;
+  const points = [
+    [0.70, 70], [0.85, 85], [1.00, 100], [1.15, 85], [1.30, 70]
+  ];
+  for (let i = 0; i < points.length - 1; i++) {
+    const [x1, y1] = points[i];
+    const [x2, y2] = points[i + 1];
+    if (acwr >= x1 && acwr <= x2) {
+      const t = (acwr - x1) / (x2 - x1);
+      return Math.round(lerp_(y1, y2, t));
+    }
+  }
+  return 100;
+}
+
+function bandOfScore_(score) {
+  if (score == null || !isFinite(score)) return 'neutral';
+  if (score >= 85) return 'success';
+  if (score >= 70) return 'warning';
+  return 'danger';
+}
+
+function mapBandToBadge_(band) {
+  if (!band) return null;
+  switch (band) {
+    case 'success':
+      return { className: 'status-success', label: 'On goal' };
+    case 'warning':
+      return { className: 'status-warning', label: 'Slight drift' };
+    case 'danger':
+      return { className: 'status-danger', label: 'Off goal' };
+    case 'green':
+      return { className: 'status-success', label: 'On goal' };
+    case 'red_high':
+    case 'red_low':
+      return { className: 'status-danger', label: 'Off goal' };
+    case 'yellow_high':
+    case 'yellow_low':
+      return { className: 'status-warning', label: 'Slight drift' };
+    default:
+      return { className: 'status-neutral', label: 'Data gap' };
+  }
+}
+
+function bandToStatusClass_(band) {
+  switch (band) {
+    case 'success':
+      return 'status-success';
+    case 'warning':
+      return 'status-warning';
+    case 'danger':
+      return 'status-danger';
+    default:
+      return 'status-neutral';
+  }
+}
+
+function bandToLabel_(band) {
+  switch (band) {
+    case 'success':
+      return 'On target';
+    case 'warning':
+      return 'Needs focus';
+    case 'danger':
+      return 'High risk';
+    default:
+      return 'Data gap';
+  }
+}
+
+function describeSeverity_(band, delta, { positiveIsGood = true } = {}) {
+  const baseMap = {
+    success: 'On target',
+    warning: 'Moderate deficit',
+    danger: 'High risk',
+    neutral: 'Data gap'
+  };
+  const base = baseMap[band] || baseMap.neutral;
+  if (delta == null || !isFinite(delta) || Math.abs(delta) < 0.01) {
+    return `${base}, → stable`;
+  }
+  if (delta > 0) {
+    return `${base}, ${positiveIsGood ? '↑ improving' : '↑ rising'}`;
+  }
+  return `${base}, ${positiveIsGood ? '↓ sliding' : '↓ easing'}`;
+}
+
+function scoreSleepBucket_({ sleepThisWeek, sleepGoal, sdMinutes, rhrDelta }) {
+  const parts = [];
+  const fulfil = pctOfGoal_(sleepThisWeek, sleepGoal);
+  if (fulfil != null) parts.push(Math.min(100, Math.round(fulfil)));
+  const consistency = computeConsistencyScore_(sdMinutes);
+  if (consistency != null) parts.push(consistency);
+  const rhrScore = computeRhrScore_(rhrDelta);
+  if (rhrScore != null) parts.push(rhrScore);
+  if (!parts.length) return { score: null, band: 'neutral' };
+  const score = Math.round(parts.reduce((a, b) => a + b, 0) / parts.length);
+  return { score, band: bandOfScore_(score) };
+}
+
+function scoreLoadBucket_({ acwr, loadPctVsTrend }) {
+  const acwrScore = mapAcwrToScore_(acwr);
+  const loadAdj = loadPctVsTrend != null && isFinite(loadPctVsTrend)
+    ? Math.max(0, Math.min(100, Math.round(100 + loadPctVsTrend)))
+    : null;
+  const parts = [];
+  if (acwrScore != null) parts.push(0.7 * acwrScore);
+  if (loadAdj != null) parts.push(0.3 * loadAdj);
+  if (!parts.length) return { score: null, band: 'neutral' };
+  const score = Math.round(parts.reduce((a, b) => a + b, 0));
+  return { score, band: bandOfScore_(score) };
+}
+
+function scoreActivityBucket_({ stepsThisWeek, stepsGoal, floorDays, floorTarget }) {
+  const stepsPct = pctOfGoal_(stepsThisWeek, stepsGoal);
+  const floorPct = (floorDays != null && floorTarget != null && isFinite(floorDays) && isFinite(floorTarget) && floorTarget > 0)
+    ? Math.max(0, Math.min(100, Math.round((floorDays / floorTarget) * 100)))
+    : null;
+  const parts = [];
+  if (stepsPct != null) parts.push(0.7 * Math.min(100, Math.round(stepsPct)));
+  if (floorPct != null) parts.push(0.3 * floorPct);
+  if (!parts.length) return { score: null, band: 'neutral' };
+  const score = Math.round(parts.reduce((a, b) => a + b, 0));
+  return { score, band: bandOfScore_(score) };
+}
+
+function scoreWorkBucket_({ hoursThisWeek, hoursGoal, deepWorkPct }) {
+  const hoursPct = pctOfGoal_(hoursThisWeek, hoursGoal);
+  const parts = [];
+  if (hoursPct != null) parts.push(0.8 * Math.min(100, Math.round(hoursPct)));
+  let deepPct = null;
+  if (deepWorkPct != null && isFinite(deepWorkPct)) deepPct = Math.max(0, Math.min(100, Math.round(deepWorkPct)));
+  if (deepPct != null) {
+    parts.push(0.2 * deepPct);
+  } else if (hoursPct != null) {
+    parts.push(0.2 * Math.min(100, Math.round(hoursPct)));
+  }
+  if (!parts.length) return { score: null, band: 'neutral' };
+  const score = Math.round(parts.reduce((a, b) => a + b, 0));
+  return { score, band: bandOfScore_(score) };
+}
+
+function computeTotalScore_(bucketScores) {
+  const weights = { sleep: 0.3, load: 0.3, activity: 0.2, work: 0.2 };
+  const available = Object.entries(bucketScores).filter(([, bucket]) => bucket && bucket.score != null);
+  if (!available.length) return null;
+  const weightSum = available.reduce((sum, [key]) => sum + weights[key], 0);
+  const total = available.reduce((sum, [key, bucket]) => sum + (weights[key] / weightSum) * bucket.score, 0);
+  return Math.round(total);
+}
+
+function gradeFromScore_(score) {
+  if (score == null || !isFinite(score)) return { grade: '—', band: 'neutral' };
+  const n = Math.max(0, Math.min(100, Math.round(score)));
+  const thresholds = [
+    [95, 'A+'], [90, 'A'], [85, 'A-'],
+    [80, 'B+'], [75, 'B'], [70, 'B-'],
+    [65, 'C+'], [60, 'C'], [55, 'C-'],
+    [45, 'D'], [0, 'F']
+  ];
+  let grade = 'F';
+  for (const [cut, letter] of thresholds) {
+    if (n >= cut) { grade = letter; break; }
+  }
+  let band = 'danger';
+  if (n >= 85) band = 'success';
+  else if (n >= 70) band = 'warning';
+  else if (n >= 45) band = 'danger';
+  else band = 'danger';
+  return { grade, band };
+}
+
+function confidenceLabelFromMissing_(missing, degraded = false) {
+  const totalGaps = (missing?.activity || 0) + (missing?.sleep || 0) + (missing?.rhr || 0);
+  const effectiveGaps = degraded ? Math.max(totalGaps, 1) : totalGaps;
+  if (!degraded && effectiveGaps === 0) return null;
+  if (effectiveGaps === 0) {
+    return { label: 'Confidence: High', className: 'status-success' };
+  }
+  if (effectiveGaps <= 2) {
+    return { label: 'Confidence: Medium', className: 'status-warning' };
+  }
+  return { label: 'Confidence: Low', className: 'status-danger' };
+}
+
+function buildIndentedLabel_(label) {
+  return `↳ ${label}`;
+}
+
+function summariseRecoveryInsight_({ band, className, delta, rhrDelta }) {
+  const voiceKey = mapStatusClassToVoiceKey_(className);
+  const voice = COACH_VOICE.sleep[voiceKey] || COACH_VOICE.sleep.neutral;
+  let observation = normalizeObservationText_(describeSeverity_(band, delta, { positiveIsGood: true })) || 'Sleep status unclear';
+  const rhrDeltaInt = rhrDelta != null && isFinite(rhrDelta) ? Math.round(rhrDelta) : null;
+  if (rhrDeltaInt != null) {
+    if (rhrDeltaInt >= CONFIG.RHR.redDelta) {
+      observation = `Sleep strain high, RHR up ${rhrDeltaInt} bpm`;
+    } else if (rhrDeltaInt >= CONFIG.RHR.amberDelta) {
+      observation = `${observation}, RHR up ${rhrDeltaInt} bpm`;
+    } else if (rhrDeltaInt <= -CONFIG.RHR.amberDelta) {
+      observation = `${observation}, RHR down ${Math.abs(rhrDeltaInt)} bpm`;
+    }
+  }
+  observation = normalizeObservationText_(observation);
+  return composeCoachInsight_(observation, voice.directive, voice.check);
+}
+
+function summariseWorkloadInsight_({ acwrValue, loadPct, rhrDelta, band }) {
+  const severityLabel = loadSeverityLabel_(acwrValue, rhrDelta);
+  const observationBase = severityLabel && severityLabel !== 'Unknown'
+    ? severityLabel
+    : normalizeObservationText_(describeSeverity_(band, loadPct, { positiveIsGood: false })) || 'Load status unclear';
+  const positiveIsGood = severityLabel === 'Under-stimulus';
+  const trendWord = describeTrendWord_(loadPct, {
+    positiveIsGood,
+    tolerance: 3,
+    upWord: positiveIsGood ? 'improving' : 'rising',
+    downWord: positiveIsGood ? 'sliding' : 'easing'
+  });
+  const observation = normalizeObservationText_(trendWord
+    ? `${observationBase}, ${trendWord}`
+    : `${observationBase}, stable`);
+  const severityVoiceKeyMap = {
+    'Under-stimulus': 'under',
+    'In band': 'inBand',
+    'Overreach': 'overreach',
+    'High risk': 'highRisk'
+  };
+  const voiceKey = severityVoiceKeyMap[severityLabel] || 'unknown';
+  const voice = COACH_VOICE.load[voiceKey] || COACH_VOICE.load.unknown;
+  return composeCoachInsight_(observation, voice.directive, voice.check);
+}
+
+function summariseActivityInsight_({ band, stepsDeltaPct, floorDays, floorTarget }) {
+  const voiceKey = COACH_VOICE.cardio[band] ? band : mapBandToVoiceKey_(band);
+  const voice = COACH_VOICE.cardio[voiceKey] || COACH_VOICE.cardio.neutral;
+  const trendWord = describeTrendWord_(stepsDeltaPct, { positiveIsGood: true, tolerance: 3, upWord: 'improving', downWord: 'sliding' });
+  let observation;
+  if (floorDays != null && floorTarget != null && floorTarget > 0 && floorDays < floorTarget) {
+    observation = `Floor short (${floorDays}/${floorTarget}), ${trendWord}`;
+  } else {
+    const base = normalizeObservationText_(describeSeverity_(band, stepsDeltaPct, { positiveIsGood: true })) || 'Movement status unclear';
+    observation = trendWord === 'stable' ? `${base}, stable` : `${base}, ${trendWord}`;
+  }
+  observation = normalizeObservationText_(observation);
+  return composeCoachInsight_(observation, voice.directive, voice.check);
+}
+
+function summariseCognitionInsight_({ workHours, goalHours, trendHours, band, delta }) {
+  const voiceKey = COACH_VOICE.work[band] ? band : mapBandToVoiceKey_(band);
+  const voice = COACH_VOICE.work[voiceKey] || COACH_VOICE.work.neutral;
+  let observation;
+  if (workHours == null) {
+    observation = 'Work data missing';
+  } else if (goalHours && workHours > goalHours * 1.1) {
+    observation = `Over goal by ${Math.round(workHours - goalHours)}h`;
+  } else if (trendHours && workHours < trendHours * 0.9) {
+    observation = `Bandwidth down ${Math.round(trendHours - workHours)}h`;
+  } else {
+    observation = normalizeObservationText_(describeSeverity_(band, delta, { positiveIsGood: false })) || 'Bandwidth steady';
+  }
+  if (workHours != null) {
+    const trendWord = describeTrendWord_(delta, { positiveIsGood: false, tolerance: 2, upWord: 'rising', downWord: 'easing' });
+    observation = normalizeObservationText_(trendWord === 'stable' ? `${observation}, stable` : `${observation}, ${trendWord}`);
+  } else {
+    observation = normalizeObservationText_(observation);
+  }
+  return composeCoachInsight_(observation, voice.directive, voice.check);
+}
+
+function buildSystemDriverCards_(payload) {
+  const {
+    sleepFulfil,
+    sleepSdText,
+    sleepLabelClass,
+    rhrDeltaText,
+    rhrDeltaValue,
+    sleepWeekly,
+    sleepTrend,
+    sleepGoal,
+    loadKgText,
+    acwrDisplay,
+    acwrValue,
+    loadPct,
+    loadWeekly,
+    loadTrend,
+    loadGoal,
+    prsThisWeek,
+    stepsText,
+    floorDaysValue,
+    floorTarget,
+    stepsDeltaPct,
+    stepsWeekly,
+    stepsTrend,
+    stepsGoal,
+    workHoursText,
+    workGoalText,
+    workTrendText,
+    workHoursValue,
+    workTrendValue,
+    workGoalValue,
+    bucketScores = {},
+    acutes = {},
+    missingCounts = {},
+    degradedMode = false,
+    latestRollup = null,
+    insufficientNote = '— (insufficient data (Sat–Fri))'
+  } = payload;
+  const sleepBucket = bucketScores.sleep || { score: null, band: 'neutral' };
+  const loadBucket = bucketScores.load || { score: null, band: 'neutral' };
+  const activityBucket = bucketScores.activity || { score: null, band: 'neutral' };
+  const workBucket = bucketScores.work || { score: null, band: 'neutral' };
+
+  const applyHeadlineScoreToBucket = (bucket, pctValue) => {
+    if (!bucket || pctValue == null || !isFinite(pctValue)) return;
+    const clamped = Math.max(0, Math.min(100, Math.round(pctValue)));
+    const gradeInfo = gradeFromScore_(clamped);
+    bucket.score = clamped;
+    bucket.grade = gradeInfo.grade;
+    bucket.band = gradeInfo.band;
+    bucket.bandClass = bandToStatusClass_(gradeInfo.band);
+    bucket.bandLabel = bandToLabel_(gradeInfo.band);
+    bucket.scoreText = `${clamped}/100`;
+  };
+
+  applyHeadlineScoreToBucket(sleepBucket, pctOfGoal(sleepTrend, sleepGoal));
+  applyHeadlineScoreToBucket(loadBucket, pctOfGoal(loadTrend, loadGoal));
+  applyHeadlineScoreToBucket(activityBucket, pctOfGoal(stepsTrend, stepsGoal));
+  applyHeadlineScoreToBucket(workBucket, pctOfGoal(workTrendValue, workGoalValue));
+
+  const dataGaps = latestRollup && latestRollup.data_gaps != null ? Number(latestRollup.data_gaps) : null;
+  const sleepDaysPresent = latestRollup && latestRollup.sleep_days_present != null ? Number(latestRollup.sleep_days_present) : null;
+  const activityDaysPresent = latestRollup && latestRollup.activity_days_present != null ? Number(latestRollup.activity_days_present) : null;
+  const insufficientGlobal = dataGaps != null && dataGaps >= 5;
+  const insufficientSleep = insufficientGlobal || (sleepDaysPresent != null && sleepDaysPresent < 3);
+  const insufficientActivity = insufficientGlobal || (activityDaysPresent != null && activityDaysPresent < 3);
+  const insufficientLoad = insufficientActivity;
+  const insufficientWork = insufficientGlobal;
+
+  const sleepBand = sleepBucket.band || 'neutral';
+  const loadBand = loadBucket.band || 'neutral';
+  const activityBand = activityBucket.band || 'neutral';
+  const workBand = workBucket.band || 'neutral';
+  const sleepScoreText = sleepBucket.scoreText || (sleepBucket.score != null ? `${sleepBucket.score}/100` : '');
+  const loadScoreText = loadBucket.scoreText || (loadBucket.score != null ? `${loadBucket.score}/100` : '');
+  const activityScoreText = activityBucket.scoreText || (activityBucket.score != null ? `${activityBucket.score}/100` : '');
+  const workScoreText = workBucket.scoreText || (workBucket.score != null ? `${workBucket.score}/100` : '');
+  const sleepGradeLetter = sleepBucket.grade || gradeFromScore_(sleepBucket.score).grade;
+  const loadGradeLetter = loadBucket.grade || gradeFromScore_(loadBucket.score).grade;
+  const activityGradeLetter = activityBucket.grade || gradeFromScore_(activityBucket.score).grade;
+  const workGradeLetter = workBucket.grade || gradeFromScore_(workBucket.score).grade;
+  const sleepBandClass = sleepBucket.bandClass || bandToStatusClass_(sleepBand);
+  const loadBandClass = loadBucket.bandClass || bandToStatusClass_(loadBand);
+  const activityBandClass = activityBucket.bandClass || bandToStatusClass_(activityBand);
+  const workBandClass = workBucket.bandClass || bandToStatusClass_(workBand);
+  const sleepBandLabel = sleepBucket.bandLabel || bandToLabel_(sleepBand);
+  const loadBandLabel = loadBucket.bandLabel || bandToLabel_(loadBand);
+  const activityBandLabel = activityBucket.bandLabel || bandToLabel_(activityBand);
+  const workBandLabel = workBucket.bandLabel || bandToLabel_(workBand);
+  const sleepAcute = acutes.sleep != null && isFinite(acutes.sleep) ? acutes.sleep : null;
+  const loadAcute = acutes.load != null && isFinite(acutes.load) ? acutes.load : null;
+  const activityAcute = acutes.activity != null && isFinite(acutes.activity) ? acutes.activity : null;
+  const workAcute = acutes.work != null && isFinite(acutes.work) ? acutes.work : null;
+
+  const confidenceBadge = confidenceLabelFromMissing_(missingCounts, degradedMode);
+  const cards = [];
+  const missingNotes = [];
+
+  const recoveryMetrics = [];
+  const sleepFourWeekPct = pctOfGoal(sleepTrend, sleepGoal);
+  if (sleepFourWeekPct != null) {
+    recoveryMetrics.push({ label: '4-wk vs Goal', value: formatPercentHeadline_('Sleep', sleepFourWeekPct) });
+  }
+  const sleepWeeklyPct = pctOfGoalUnlimited_(sleepWeekly, sleepGoal);
+  if (sleepWeeklyPct != null) {
+    const sleepThisWeekValue = insufficientSleep ? insufficientNote : formatPercentValue_(sleepWeeklyPct);
+    recoveryMetrics.push({ label: 'This Week vs Goal', value: sleepThisWeekValue });
+  }
+  if (sleepSdText) recoveryMetrics.push({ label: 'Sleep SD', value: sleepSdText });
+  if (rhrDeltaText) recoveryMetrics.push({ label: 'RHR Δ', value: rhrDeltaText });
+  if (recoveryMetrics.length) {
+    const recoverySeverity = describeSeverity_(sleepBand, sleepAcute, { positiveIsGood: true });
+    cards.push({
+      key: 'recovery',
+      title: 'Recovery',
+      className: 'card card--recovery',
+      grade: sleepGradeLetter,
+      score: sleepScoreText,
+      bandClass: sleepBandClass,
+      bandLabel: sleepBandLabel,
+      severity: recoverySeverity,
+      ...(confidenceBadge ? { badge: { ...confidenceBadge } } : {}),
+      metrics: recoveryMetrics,
+      insight: summariseRecoveryInsight_({
+        band: sleepBand,
+        className: sleepLabelClass,
+        delta: sleepAcute,
+        rhrDelta: rhrDeltaValue
+      })
+    });
+  } else {
+    missingNotes.push('Recovery card incomplete — sleep or RHR data missing.');
+  }
+
+  const volumeMetrics = [];
+  const loadFourWeekPct = pctOfGoal(loadTrend, loadGoal);
+  if (loadFourWeekPct != null) {
+    volumeMetrics.push({ label: '4-wk vs Goal', value: formatPercentHeadline_('Gym Volume', loadFourWeekPct) });
+  }
+  const loadWeeklyPct = pctOfGoal(loadWeekly, loadGoal);
+  if (loadWeeklyPct != null) {
+    const loadThisWeekValue = insufficientLoad ? insufficientNote : formatPercentValue_(loadWeeklyPct);
+    volumeMetrics.push({ label: 'This Week vs Goal', value: loadThisWeekValue });
+  }
+  if (typeof prsThisWeek === 'number' && !Number.isNaN(prsThisWeek)) {
+    volumeMetrics.push({ label: 'PRs this Week', value: fmtInt(prsThisWeek) });
+  }
+  if (acwrDisplay) volumeMetrics.push({ label: 'ACWR', value: acwrDisplay });
+  if (volumeMetrics.length) {
+    const mappedSeverity = loadSeverityLabel_(acwrValue, rhrDeltaValue);
+    let workloadSeverity = describeSeverity_(loadBand, loadAcute, { positiveIsGood: false });
+    if (mappedSeverity && mappedSeverity !== 'Unknown') {
+      workloadSeverity = mappedSeverity;
+    }
+    cards.push({
+      key: 'workload',
+      title: 'Gym Volume',
+      className: 'card card--workload',
+      grade: loadGradeLetter,
+      score: loadScoreText,
+      bandClass: loadBandClass,
+      bandLabel: loadBandLabel,
+      severity: workloadSeverity,
+      ...(confidenceBadge ? { badge: { ...confidenceBadge } } : {}),
+      metrics: volumeMetrics,
+      insight: summariseWorkloadInsight_({
+        acwrValue,
+        loadPct: insufficientLoad ? null : loadPct,
+        rhrDelta: rhrDeltaValue,
+        band: loadBand
+      })
+    });
+  } else {
+    missingNotes.push('Gym Volume card incomplete — load metrics unavailable.');
+  }
+
+  const cardioMetrics = [];
+  const stepsFourWeekPct = pctOfGoal(stepsTrend, stepsGoal);
+  if (stepsFourWeekPct != null) {
+    cardioMetrics.push({ label: '4-wk vs Goal', value: formatPercentHeadline_('Steps', stepsFourWeekPct) });
+  }
+  const stepsWeeklyPct = pctOfGoal(stepsWeekly, stepsGoal);
+  if (stepsWeeklyPct != null) {
+    const stepsThisWeekValue = insufficientActivity ? insufficientNote : formatPercentValue_(stepsWeeklyPct);
+    cardioMetrics.push({ label: 'This Week vs Goal', value: stepsThisWeekValue });
+  }
+  const floorHeadline = formatFloorCompliance_(floorDaysValue, floorTarget);
+  if (floorHeadline !== '—') {
+    cardioMetrics.push({ label: 'Floor', value: floorHeadline });
+  }
+  if (cardioMetrics.length) {
+    const activitySeverity = describeSeverity_(activityBand, activityAcute, { positiveIsGood: true });
+    cards.push({
+      key: 'activity',
+      title: 'Cardio',
+      className: 'card card--activity',
+      grade: activityGradeLetter,
+      score: activityScoreText,
+      bandClass: activityBandClass,
+      bandLabel: activityBandLabel,
+      severity: activitySeverity,
+      ...(confidenceBadge ? { badge: { ...confidenceBadge } } : {}),
+      metrics: cardioMetrics,
+      insight: summariseActivityInsight_({
+        band: activityBand,
+        stepsDeltaPct: insufficientActivity ? null : stepsDeltaPct,
+        floorDays: floorDaysValue,
+        floorTarget
+      })
+    });
+  } else {
+    missingNotes.push('Cardio card incomplete — step data missing.');
+  }
+
+  const cognitionMetrics = [];
+  const workFourWeekPct = pctOfGoal(workTrendValue, workGoalValue);
+  if (workFourWeekPct != null) {
+    cognitionMetrics.push({ label: '4-wk vs Goal', value: formatPercentHeadline_('Work', workFourWeekPct) });
+  }
+  const workWeeklyPct = pctOfGoal(workHoursValue, workGoalValue);
+  if (workWeeklyPct != null) {
+    const workThisWeekValue = insufficientWork ? insufficientNote : formatPercentValue_(workWeeklyPct);
+    cognitionMetrics.push({ label: 'This Week vs Goal', value: workThisWeekValue });
+  }
+  if (workGoalText) cognitionMetrics.push({ label: 'Goal', value: workGoalText });
+  if (workTrendText) cognitionMetrics.push({ label: '4-wk Avg', value: workTrendText });
+  if (cognitionMetrics.length) {
+    const workSeverity = describeSeverity_(workBand, workAcute, { positiveIsGood: true });
+    cards.push({
+      key: 'cognition',
+      title: 'Cognition & Work',
+      className: 'card card--cognition',
+      grade: workGradeLetter,
+      score: workScoreText,
+      bandClass: workBandClass,
+      bandLabel: workBandLabel,
+      severity: workSeverity,
+      ...(confidenceBadge ? { badge: { ...confidenceBadge } } : {}),
+      metrics: cognitionMetrics,
+      insight: summariseCognitionInsight_({
+        workHours: workHoursValue,
+        goalHours: workGoalValue,
+        trendHours: workTrendValue,
+        band: workBand,
+        delta: insufficientWork ? null : workAcute
+      })
+    });
+  } else {
+    missingNotes.push('Cognition card incomplete — work hours unavailable.');
+  }
+
+  return { cards, missingNotes };
+}
+
+function buildComponentRows_(weekly, trend, goals, ds, sleepConsistency, acwrValue, bucketScores = {}, acutes = {}) {
+  const rows = [];
+  const sleepBucketScore = bucketScores.sleep || {};
+  const loadBucketScore = bucketScores.load || {};
+  const activityBucketScore = bucketScores.activity || {};
+  const workBucketScore = bucketScores.work || {};
+
+  const sleepBand = sleepBucketScore.band || 'neutral';
+  const loadBand = loadBucketScore.band || 'neutral';
+  const activityBand = activityBucketScore.band || 'neutral';
+  const workBand = workBucketScore.band || 'neutral';
+
+  const sleepScoreText = sleepBucketScore.scoreText || (sleepBucketScore.score != null ? `${sleepBucketScore.score}/100` : '');
+  const loadScoreText = loadBucketScore.scoreText || (loadBucketScore.score != null ? `${loadBucketScore.score}/100` : '');
+  const activityScoreText = activityBucketScore.scoreText || (activityBucketScore.score != null ? `${activityBucketScore.score}/100` : '');
+  const workScoreText = workBucketScore.scoreText || (workBucketScore.score != null ? `${workBucketScore.score}/100` : '');
+
+  const sleepBandClass = sleepBucketScore.bandClass || bandToStatusClass_(sleepBand);
+  const loadBandClass = loadBucketScore.bandClass || bandToStatusClass_(loadBand);
+  const activityBandClass = activityBucketScore.bandClass || bandToStatusClass_(activityBand);
+  const workBandClass = workBucketScore.bandClass || bandToStatusClass_(workBand);
+
+  const sleepBandLabel = sleepBucketScore.bandLabel || bandToLabel_(sleepBand);
+  const loadBandLabel = loadBucketScore.bandLabel || bandToLabel_(loadBand);
+  const activityBandLabel = activityBucketScore.bandLabel || bandToLabel_(activityBand);
+  const workBandLabel = workBucketScore.bandLabel || bandToLabel_(workBand);
+
+  const sleepGradeLetter = sleepBucketScore.grade || gradeFromScore_(sleepBucketScore.score).grade;
+  const loadGradeLetter = loadBucketScore.grade || gradeFromScore_(loadBucketScore.score).grade;
+  const activityGradeLetter = activityBucketScore.grade || gradeFromScore_(activityBucketScore.score).grade;
+  const workGradeLetter = workBucketScore.grade || gradeFromScore_(workBucketScore.score).grade;
+
+  const sleepAcute = acutes.sleep != null ? acutes.sleep : null;
+  const loadAcute = acutes.load != null ? acutes.load : null;
+  const activityAcute = acutes.activity != null ? acutes.activity : null;
+  const workAcute = acutes.work != null ? acutes.work : null;
+
+  const addMetricBlock = ({
+    label,
+    weeklyValue,
+    trendValue,
+    goalValue,
+    valueFormatter,
+    deltaOptions = {},
+    badgeBand
+  }) => {
+    const baseRow = {
+      metric: label,
+      current: formatOrDash_(weeklyValue, valueFormatter),
+      average: formatOrDash_(trendValue, valueFormatter),
+      acute: '—',
+      target: formatOrDash_(goalValue, valueFormatter),
+      fourWeekGoal: '—'
+    };
+    const badge = mapBandToBadge_(badgeBand);
+    if (badge && badge.label !== 'Data gap') {
+      baseRow.badge = badge;
+    } else if (goalValue == null) {
+      baseRow.badge = { className: 'status-neutral', label: 'Goal missing' };
+    }
+    rows.push(baseRow);
+
+    if (trendValue != null && goalValue != null) {
+      rows.push({
+        metric: buildIndentedLabel_('4-wk vs Goal'),
+        current: '—',
+        average: '—',
+        acute: '—',
+        target: formatOrDash_(goalValue, valueFormatter),
+        fourWeekGoal: formatDeltaArrow(trendValue, goalValue, deltaOptions)
+      });
+    }
+
+    if (weeklyValue != null && trendValue != null) {
+      rows.push({
+        metric: buildIndentedLabel_('This Week vs 4-wk'),
+        current: '—',
+        average: '—',
+        acute: formatDeltaArrow(weeklyValue, trendValue, deltaOptions),
+        target: '—',
+        fourWeekGoal: '—'
+      });
+    }
+  };
+
+  // Sleep block
+  addMetricBlock({
+    label: 'Sleep (min)',
+    weeklyValue: weekly.sleep,
+    trendValue: trend.sleep,
+    goalValue: goals.sleepMinutes || null,
+    valueFormatter: fmtHMin,
+    deltaOptions: { units: 'minutes' },
+    badgeBand: sleepBucketScore.band
+  });
+
+  const sleepSd = sleepConsistency?.sdMinutes;
+  rows.push({
+    metric: 'Sleep SD (min)',
+    current: sleepSd != null ? fmtDurationMinutes_(sleepSd) : '—',
+    average: '—',
+    acute: '—',
+    target: '≤30m',
+    fourWeekGoal: '—'
+  });
+
+  // RHR
+  const rhrCurrent = weekly.rhr;
+  const rhrTrend = trend.rhr;
+  const rhrGoalFormatted = goals.restingHeartRate ? fmtBpm(goals.restingHeartRate) : '—';
+  const rhrDeltaArrow = (rhrCurrent != null && rhrTrend != null)
+    ? formatDeltaArrow(rhrCurrent, rhrTrend, { units: 'bpm', decimals: 0 })
+    : '—';
+  rows.push({
+    metric: 'RHR (bpm)',
+    current: formatOrDash_(rhrCurrent, fmtBpm),
+    average: formatOrDash_(rhrTrend, fmtBpm),
+    acute: '—',
+    target: rhrGoalFormatted,
+    fourWeekGoal: '—'
+  });
+  if (rhrTrend != null && goals.restingHeartRate) {
+    rows.push({
+      metric: buildIndentedLabel_('4-wk vs Goal'),
+      current: '—',
+      average: '—',
+      acute: '—',
+      target: rhrGoalFormatted,
+      fourWeekGoal: formatDeltaArrow(rhrTrend, goals.restingHeartRate, { units: 'bpm', decimals: 0 })
+    });
+  }
+  if (rhrDeltaArrow !== '—') {
+    rows.push({
+      metric: buildIndentedLabel_('This Week vs 4-wk'),
+      current: '—',
+      average: '—',
+      acute: rhrDeltaArrow,
+      target: '—',
+      fourWeekGoal: '—'
+    });
+  }
+
+  // Training load block
+  addMetricBlock({
+    label: 'Training Load (kg)',
+    weeklyValue: weekly.trainingLoad,
+    trendValue: trend.trainingLoad,
+    goalValue: goals.weeklyTrainingLoad || null,
+    valueFormatter: value => `${fmtInt(value)}kg`,
+    deltaOptions: { units: 'kg' },
+    badgeBand: loadBucketScore.band
+  });
+
+  // ACWR remains acute gate
+  rows.push({
+    metric: 'ACWR',
+    current: acwrValue != null ? Number(acwrValue).toFixed(2) : '—',
+    average: '1.00',
+    acute: acwrValue != null ? formatDeltaArrow(acwrValue, 1, { units: 'ratio', decimals: 2 }) : '—',
+    target: '0.8–1.3',
+    fourWeekGoal: '—'
+  });
+
+  // Steps block
+  addMetricBlock({
+    label: 'Steps (k)',
+    weeklyValue: weekly.steps,
+    trendValue: trend.steps,
+    goalValue: goals.steps || null,
+    valueFormatter: fmtSteps_,
+    deltaOptions: { units: 'steps-diff' },
+    badgeBand: activityBucketScore.band
+  });
+
+  // Work hours block
+  addMetricBlock({
+    label: 'Work Hours',
+    weeklyValue: weekly.workHours,
+    trendValue: trend.workHours,
+    goalValue: goals.weeklyWorkHours || null,
+    valueFormatter: value => `${Math.round(value)}h`,
+    deltaOptions: { units: 'hours', decimals: 1 },
+    badgeBand: workBucketScore.band
+  });
+
+  return rows;
+}
+
+function buildCompositeSummary_({
+  weeklyRollups = [],
+  weekly = {},
+  goals = {},
+  acwrValue = null,
+  sleepConsistencySd = null,
+  weekMeta = null
+} = {}) {
+  const toNumber = value => {
+    if (value == null || value === '') return null;
+    const num = Number(value);
+    return isFinite(num) ? num : null;
+  };
+
+  const currentWeekStartIso = weekMeta?.start ? formatDateIso_(weekMeta.start) : formatDateIso_(new Date());
+
+  const parsed = (weeklyRollups || [])
+    .map(row => {
+      const weekStart = String(row.week_start || row.weekStart || '').trim();
+      if (!weekStart) return null;
+      return {
+        weekStart,
+        sleepMinAvg: toNumber(row.sleep_min_avg ?? row.sleepMinAvg),
+        sleepSdMin: toNumber(row.sleep_sd_min ?? row.sleepSdMin),
+        rhrAvg: toNumber(row.rhr_avg ?? row.rhrAvg),
+        stepsDayAvg: toNumber(row.steps_day_avg ?? row.stepsDayAvg),
+        gymLoadSum: toNumber(row.gym_load_sum ?? row.gymLoadSum),
+        workHoursSum: toNumber(row.work_hours_sum ?? row.workHoursSum),
+        acwr: toNumber(row.acwr),
+        readinessPct: toNumber(row.readiness_pct ?? row.readinessPct),
+        outputPct: toNumber(row.output_pct ?? row.outputPct),
+        dataGaps: toNumber(row.data_gaps ?? row.dataGaps),
+        sleepDaysPresent: toNumber(row.sleep_days_present ?? row.sleepDaysPresent),
+        activityDaysPresent: toNumber(row.activity_days_present ?? row.activityDaysPresent)
+      };
+    })
+    .filter(Boolean)
+    .sort((a, b) => new Date(a.weekStart) - new Date(b.weekStart));
+
+  const ensureCurrentEntry = () => {
+    const candidate = {
+      weekStart: currentWeekStartIso,
+      sleepMinAvg: toNumber(weekly.sleep),
+      sleepSdMin: toNumber(sleepConsistencySd),
+      rhrAvg: toNumber(weekly.rhr),
+      stepsDayAvg: toNumber(weekly.steps),
+      gymLoadSum: toNumber(weekly.trainingLoad),
+      workHoursSum: toNumber(weekly.workHours),
+      acwr: toNumber(acwrValue),
+      readinessPct: null,
+      outputPct: null
+    };
+    const hasData = ['sleepMinAvg', 'sleepSdMin', 'rhrAvg', 'stepsDayAvg', 'gymLoadSum', 'workHoursSum', 'acwr'].some(key => candidate[key] != null && isFinite(candidate[key]));
+    if (!hasData) return;
+    const latest = parsed[parsed.length - 1];
+    if (latest && latest.weekStart === currentWeekStartIso) {
+      Object.keys(candidate).forEach(key => {
+        if (candidate[key] != null && (latest[key] == null || !isFinite(latest[key]))) {
+          latest[key] = candidate[key];
+        }
+      });
+      return;
+    }
+    parsed.push(candidate);
+  };
+
+  ensureCurrentEntry();
+
+  const lastEntries = parsed.slice(-4).reverse(); // newest first
+
+  if (!lastEntries.length) {
+    return {
+      readiness: { pct: null, trend: null, subtitle: 'Readiness data missing — log recovery inputs.' },
+      output: { pct: null, trend: null, subtitle: 'Output data missing — keep execution logs.' },
+      plan: { code: 'HOLD', balance: null, narrative: 'Data limited this week — log core metrics daily.' },
+      series: { readiness: [], output: [] }
+    };
+  }
+
+  const sleepGoal = goals.sleepMinutes != null ? Number(goals.sleepMinutes) : null;
+  const rhrGoal = goals.restingHeartRate != null ? Number(goals.restingHeartRate) : null;
+  const stepsGoal = goals.steps != null ? Number(goals.steps) : null;
+  const workGoal = goals.weeklyWorkHours != null ? Number(goals.weeklyWorkHours) : null;
+  const gymGoal = goals.weeklyTrainingLoad != null ? Number(goals.weeklyTrainingLoad) : null;
+
+  const readinessPerWeek = [];
+  const outputPerWeek = [];
+  const latestEntry = lastEntries[0] || null;
+
+  lastEntries.forEach(entry => {
+    const sleepPct = pctOfGoal_(entry.sleepMinAvg, sleepGoal);
+    const rhrScore = mapRhrDeltaToPct_(entry.rhrAvg, rhrGoal);
+    const sdScore = mapSdToPct_(entry.sleepSdMin);
+    const acwrScore = mapAcwrToPct_(entry.acwr != null ? entry.acwr : acwrValue);
+
+    const readinessVal = entry.readinessPct != null && isFinite(entry.readinessPct)
+      ? entry.readinessPct
+      : weightedAverage_([
+          [0.4, sleepPct],
+          [0.3, rhrScore],
+          [0.2, sdScore],
+          [0.1, acwrScore]
+        ]);
+    readinessPerWeek.push(readinessVal != null && isFinite(readinessVal) ? readinessVal : null);
+
+    const gymPct = pctOfGoal_(entry.gymLoadSum, gymGoal);
+    const stepsPct = pctOfGoal_(entry.stepsDayAvg, stepsGoal);
+    const workPct = pctOfGoal_(entry.workHoursSum, workGoal);
+
+    const outputVal = entry.outputPct != null && isFinite(entry.outputPct)
+      ? entry.outputPct
+      : weightedAverage_([
+          [0.4, gymPct],
+          [0.3, stepsPct],
+          [0.3, workPct]
+        ]);
+    outputPerWeek.push(outputVal != null && isFinite(outputVal) ? outputVal : null);
+  });
+
+  const readinessBlend = recencyBlend4w_(readinessPerWeek, [0.4, 0.3, 0.2, 0.1]);
+  const outputBlend = recencyBlend4w_(outputPerWeek, [0.5, 0.25, 0.15, 0.10]);
+
+  const readinessPct = readinessBlend != null ? pctClamp_(readinessBlend) : null;
+  const outputPct = outputBlend != null ? pctClamp_(outputBlend) : null;
+
+  const readinessTrendRaw = readinessPerWeek.length > 1 ? trendDelta_(readinessPerWeek[0], readinessPerWeek[1]) : null;
+  const outputTrendRaw = outputPerWeek.length > 1 ? trendDelta_(outputPerWeek[0], outputPerWeek[1]) : null;
+
+  const readinessTrend = readinessTrendRaw != null ? Math.round(readinessTrendRaw) : null;
+  const outputTrend = outputTrendRaw != null ? Math.round(outputTrendRaw) : null;
+
+  const balance = (readinessPct != null && outputPct != null) ? readinessPct - outputPct : null;
+  let planCode = 'HOLD';
+  if (balance != null) {
+    if (balance >= 8) planCode = 'PUSH';
+    else if (balance <= -8) planCode = 'RECOVER';
+    else planCode = 'HOLD';
+  }
+  const narrative = buildPlanSummaryText_(readinessPct, outputPct, readinessTrend, outputTrend, balance);
+
+  return {
+    readiness: {
+      pct: readinessPct,
+      trend: readinessTrend,
+      subtitle: copyReadiness_(readinessPct, readinessTrend)
+    },
+    output: {
+      pct: outputPct,
+      trend: outputTrend,
+      subtitle: copyOutput_(outputPct, outputTrend)
+    },
+    plan: {
+      code: planCode,
+      balance,
+      narrative
+    },
+    series: {
+      readiness: readinessPerWeek,
+      output: outputPerWeek
+    },
+    latest: latestEntry || null
+  };
+}
+
+function validateDataSchema_() {
+  const ss = SpreadsheetApp.getActive();
+  const errors = [];
+  Object.keys(DATA_SCHEMA_REQUIREMENTS).forEach(sheetName => {
+    const sh = ss.getSheetByName(sheetName);
+    if (!sh) {
+      errors.push(`${sheetName}: missing tab`);
+      return;
+    }
+    const range = sh.getDataRange();
+    if (!range) {
+      errors.push(`${sheetName}: no data range`);
+      return;
+    }
+    const values = range.getValues();
+    if (!values.length) {
+      errors.push(`${sheetName}: empty sheet`);
+      return;
+    }
+    const headers = values[0].map(h => String(h || '').trim().toLowerCase());
+    const headerSet = new Set(headers);
+    DATA_SCHEMA_REQUIREMENTS[sheetName].forEach(requirement => {
+      const candidates = Array.isArray(requirement) ? requirement : [requirement];
+      const satisfied = candidates.some(name => headerSet.has(String(name || '').toLowerCase()));
+      if (!satisfied) {
+        const label = candidates[0];
+        const alts = candidates.slice(1).length ? ` (alternatives: ${candidates.slice(1).join(', ')})` : '';
+        errors.push(`${sheetName}: missing header "${label}"${alts}`);
+      }
+    });
+  });
+  return { ok: errors.length === 0, errors };
+}
+
+function sendOpsEmail_(subject, body) {
+  GmailApp.sendEmail(OPS_EMAIL, subject, body);
+}
+
+function sendSchemaFailureEmail_(errors, weekMeta) {
+  const subject = `HealthReport BLOCKED ${weekMeta?.isoLabel || ''}`.trim();
+  const list = errors.map(err => `- ${err}`).join('\n');
+  const body = `Weekly report halted due to data schema mismatch.\n\nWeek: ${weekMeta?.label || 'Unknown'}\nIssues:\n${list}\n\nNext step: restore the listed tabs/headers before rerunning.`;
+  sendOpsEmail_(subject, body);
+}
+
+function sendJobFailureEmail_(weekMeta, stage, error) {
+  const subject = `HealthReport FAILED ${weekMeta?.isoLabel || ''}`.trim();
+  const body = `Weekly report generation failed.\n\nWeek: ${weekMeta?.label || 'Unknown'}\nStage: ${stage}\nMessage: ${error?.message || 'Unknown error'}\nStack: ${error?.stack || 'n/a'}\n\nNext step: review Apps Script logs and rerun once resolved.`;
+  sendOpsEmail_(subject, body);
+}
+
+function weeklyReportJob() {
+  const weekMeta = getWeekMetadataForReport_();
+  logWeeklyJob_('weekly_job:start', { week: weekMeta?.label || 'unknown', iso: weekMeta?.isoLabel || '' });
+  let stage = 'init';
+  const degradeReasons = [];
+  let aiParseOk = false;
+  let schemaDiag = '';
+  let aiParseError = '';
+  const referenceDate = new Date();
+  referenceDate.setDate(referenceDate.getDate() - 7);
+  setWeekReferenceOverride(referenceDate);
+  logWeeklyJob_('weekly_job:reference_set', { referenceDate: referenceDate.toISOString() });
+  try {
+    stage = 'schema_validation';
+    logWeeklyJob_('weekly_job:stage', { stage });
+    const schemaCheck = validateDataSchema_();
+    logWeeklyJob_('weekly_job:schema_validation_result', { ok: schemaCheck.ok, errors: schemaCheck.errors });
+    if (!schemaCheck.ok) {
+      sendSchemaFailureEmail_(schemaCheck.errors, weekMeta);
+      return;
+    }
+
+    stage = 'load_goals';
+    logWeeklyJob_('weekly_job:stage', { stage });
+    const USER_GOALS = getUserGoals();
+    if (!USER_GOALS) {
+      logWeeklyJob_('weekly_job:goals_missing', {});
+      sendJobFailureEmail_(weekMeta, stage, new Error('Could not load goals from the "Goals" tab.'));
+      return;
+    }
+    logWeeklyJob_('weekly_job:goals_loaded', { goalKeys: Object.keys(USER_GOALS || {}).length });
+
+    stage = 'load_weekly_data';
+    logWeeklyJob_('weekly_job:stage', { stage });
+    const weekly = {
+      steps:         getWeeklyAverageFromActivity('steps'),
+      trainingLoad:  getWeeklySumFromActivity('volume_kg'),
+      workHours:     getWeeklySumFromActivity('working hours'),
+      prs:           getWeeklySumFromActivity('prs') || 0,
+      sleep:         getWeeklyAverage('Sleep', 'sleep_total_min'),
+      rhr:           getWeeklyAverage('HeartRate', 'resting_heart_rate')
+    };
+    const missingWeeklyFields = [];
+    if (typeof weekly.steps !== 'number') { weekly.steps = null; missingWeeklyFields.push('Activity'); }
+    if (typeof weekly.sleep !== 'number') { weekly.sleep = null; missingWeeklyFields.push('Sleep'); }
+    if (typeof weekly.rhr !== 'number') { weekly.rhr = null; missingWeeklyFields.push('HeartRate'); }
+    if (missingWeeklyFields.length) {
+      degradeReasons.push(`missing_weekly_data:${missingWeeklyFields.join(',')}`);
+      logWeeklyJob_('weekly_job:weekly_data_missing', { missing: missingWeeklyFields });
+    }
+    logWeeklyJob_('weekly_job:weekly_data_loaded', {
+      steps: weekly.steps,
+      sleep: weekly.sleep,
+      rhr: weekly.rhr,
+      trainingLoad: weekly.trainingLoad,
+      workHours: weekly.workHours
+    });
+
+    stage = 'load_trend_data';
+    logWeeklyJob_('weekly_job:stage', { stage });
+    const trend = {
+      steps:         get4WeekAverageFromActivity('steps', 'avg'),
+      trainingLoad:  get4WeekAverageFromActivity('volume_kg', 'sum'),
+      workHours:     get4WeekAverageFromActivity('working hours', 'sum'),
+      prs:           get4WeekAverageFromActivity('prs', 'sum') || 0,
+      sleep:         get4WeekAverage('Sleep', 'sleep_total_min'),
+      rhr:           get4WeekAverage('HeartRate', 'resting_heart_rate')
+    };
+    logWeeklyJob_('weekly_job:trend_data_loaded', {
+      steps: trend.steps,
+      sleep: trend.sleep,
+      rhr: trend.rhr,
+      trainingLoad: trend.trainingLoad,
+      workHours: trend.workHours
+    });
+
+    stage = 'derive_stats';
+    logWeeklyJob_('weekly_job:stage', { stage });
+    const sleepConsistency = computeSleepConsistencyWeekly_();
+    const acwrInfo = computeWeeklyACWR_(weekly.trainingLoad);
+    weekly.sleepConsistency = sleepConsistency;
+    weekly.acwr = acwrInfo;
+    const derivedStats = computeDerivedStats(weekly, trend, USER_GOALS, sleepConsistency, acwrInfo);
+    logWeeklyJob_('weekly_job:derived_ready', {
+      degradeReasons: degradeReasons.slice(),
+      hasSleepConsistency: Boolean(sleepConsistency),
+      hasAcwr: Boolean(acwrInfo)
+    });
+
+    const weeklyRollups = getWeeklyRollups_(8);
+    const compositeSummary = buildCompositeSummary_({
+      weeklyRollups,
+      weekly,
+      goals: USER_GOALS,
+      acwrValue: acwrInfo?.value ?? acwrInfo?.ratio ?? null,
+      sleepConsistencySd: sleepConsistency?.sdMinutes ?? null,
+      weekMeta
+    });
+
+    const capacity = classifyCapacityWithPurple(weekly, trend, USER_GOALS, derivedStats);
+    const decision = decideNextAction(weekly, trend, USER_GOALS, derivedStats, capacity);
+    logWeeklyJob_('weekly_job:decision_ready', {
+      capacityStatus: capacity?.status || null,
+      plan: decision?.plan || null
+    });
+
+    const perf = calculatePerformanceIndex(weekly, trend, USER_GOALS);
+    const recovery  = scoreFromTarget_(weekly.sleep, USER_GOALS.sleepMinutes);
+    const readiness = Math.max(0, Math.min(100, 100 - scoreFromTarget_(weekly.rhr, USER_GOALS.restingHeartRate, true)));
+
+    const scores = {
+      overall: Math.round(0.4 * perf.PI + 0.3 * recovery + 0.3 * readiness),
+      activity: perf.PI,
+      recovery,
+      readiness,
+      parts: perf.components
+    };
+
+    const rhrDeltaValueForScore = parseSignedNumber_(derivedStats?.rhr?.deltaTrendStr);
+    const bucketScores = {
+      sleep: scoreSleepBucket_({
+        sleepThisWeek: weekly.sleep,
+        sleepGoal: USER_GOALS.sleepMinutes,
+        sdMinutes: sleepConsistency?.sdMinutes,
+        rhrDelta: rhrDeltaValueForScore
+      }),
+      load: scoreLoadBucket_({
+        acwr: acwrInfo?.value ?? acwrInfo?.ratio ?? null,
+        loadPctVsTrend: derivedStats?.load?.pctTrend
+      }),
+      activity: scoreActivityBucket_({
+        stepsThisWeek: weekly.steps,
+        stepsGoal: USER_GOALS.steps,
+        floorDays: derivedStats?.steps?.days6k,
+        floorTarget: USER_GOALS.stepsFloorDays || CONFIG.Steps.fallbackFloorDays
+      }),
+      work: scoreWorkBucket_({
+        hoursThisWeek: weekly.workHours,
+        hoursGoal: USER_GOALS.weeklyWorkHours,
+        deepWorkPct: derivedStats?.work?.deepWorkPct ?? null
+      })
+    };
+    Object.values(bucketScores).forEach(bucket => {
+      const gradeInfo = gradeFromScore_(bucket.score);
+      bucket.grade = gradeInfo.grade;
+      bucket.band = gradeInfo.band;
+      bucket.bandClass = bandToStatusClass_(gradeInfo.band);
+      bucket.bandLabel = bandToLabel_(gradeInfo.band);
+      bucket.scoreText = bucket.score != null ? `${bucket.score}/100` : '';
+    });
+    const totalBucketScore = computeTotalScore_(bucketScores);
+    const totalGradeInfo = gradeFromScore_(totalBucketScore);
+
+    stage = 'ai_call';
+    const fulfil = derivedStats?.fulfilment || {};
+    const bands = derivedStats?.bands || {};
+    const baselineSections = composeBaselineSections_(weekly, trend, USER_GOALS, derivedStats, fulfil, bands, decision, FALLBACK_RECOMMENDATIONS);
+    const fallbackReport = buildFallbackReport_(scores, derivedStats, baselineSections, decision);
+    if (degradeReasons.length) {
+      fallbackReport.metadata.degraded = true;
+      fallbackReport.metadata.degradeReason = degradeReasons.join('|');
+    }
+
+    logWeeklyJob_('weekly_job:ai_prompt_ready', {
+      degradeReasons: degradeReasons.slice(),
+      bucketScoreTotal: totalBucketScore
+    });
+    const aiResponseText = callOpenAIChat_(buildEvaluationPrompt(weekly, trend, scores, USER_GOALS, derivedStats, capacity, decision));
+    logWeeklyJob_('weekly_job:ai_response_received', { hasResponse: Boolean(aiResponseText) });
+    if (!aiResponseText) {
+      fallbackReport.metadata.degraded = true;
+      fallbackReport.metadata.degradeReason = 'empty_response';
+      schemaDiag = 'empty_response';
+      aiParseError = 'empty_response';
+    }
+
+    let aiReport = null;
+    let degradeReason = degradeReasons.join('|');
+    if (aiResponseText) {
+      const parsed = parseAiReportJson_(aiResponseText);
+      logWeeklyJob_('weekly_job:ai_parse_attempt', { ok: parsed.ok, error: parsed.error || null });
+      if (parsed.ok) {
+        const validation = validateReportSchema_(parsed.data);
+        logWeeklyJob_('weekly_job:ai_schema_validation', { ok: validation.ok, errors: validation.errors || null });
+        if (validation.ok) {
+          aiReport = validation.report;
+          aiParseOk = true;
+          schemaDiag = schemaDiag || 'ok';
+        } else {
+          degradeReason = `schema_invalid:${validation.errors.join('|')}`;
+          schemaDiag = `schema_errors: ${validation.errors.join('|')}`;
+          aiParseError = schemaDiag;
+        }
+      } else {
+        degradeReason = parsed.error;
+        schemaDiag = parsed.error || 'parse_error';
+        aiParseError = parsed.error || 'parse_error';
+      }
+    }
+
+    const merged = mergeAiWithFallback_(aiReport, fallbackReport);
+    const reportPayload = merged.report;
+    const degraded = Boolean(merged.degraded || !aiReport || (degradeReason && degradeReason.length));
+    reportPayload.metadata = reportPayload.metadata || {};
+    reportPayload.metadata.bucketScores = bucketScores;
+    reportPayload.metadata.totalBucketScore = totalBucketScore;
+    reportPayload.metadata.totalGrade = totalGradeInfo.grade;
+    reportPayload.metadata.totalBand = totalGradeInfo.band;
+
+    if (compositeSummary) {
+      reportPayload.metadata.composites = compositeSummary;
+    }
+
+    if (degraded) {
+      reportPayload.metadata.degraded = true;
+      reportPayload.metadata.degradeReason = degradeReason || merged.reason || 'unknown';
+    } else {
+      reportPayload.metadata.degraded = false;
+      reportPayload.metadata.degradeReason = '';
+    }
+
+    if (reportPayload.metadata.degradeReason && /coach_call_missing/i.test(reportPayload.metadata.degradeReason)) {
+      const planKey = (reportPayload.decision?.plan || compositeSummary?.plan?.code || 'Hold').toString().toLowerCase();
+      const fallbackCoachMap = {
+        push: 'Push with measured progression; monitor readiness daily.',
+        hold: 'Maintain workload and protect sleep routine.',
+        sustain: 'Maintain workload and protect sleep routine.',
+        recover: 'Deload and bank recovery this week.',
+        deload: 'Deload and bank recovery this week.'
+      };
+      const fallbackCoach = fallbackCoachMap[planKey] || 'Hold steady and reinforce core recovery habits.';
+    if (!reportPayload.coachCall || !String(reportPayload.coachCall).trim()) {
+      reportPayload.coachCall = fallbackCoach;
+    }
+    reportPayload.metadata.degraded = false;
+    reportPayload.metadata.degradeReason = '';
+    degradeReason = '';
+    }
+
+    logWeeklyJob_('weekly_job:distribute_prepare', {
+      degraded: reportPayload.metadata.degraded,
+      degradeReason: reportPayload.metadata.degradeReason || '',
+      stage
+    });
+
+    // Build driver cards and component rows (moved from top level into try block)
+    const readinessTileData = compositeSummary?.readiness || {};
+    const outputTileData = compositeSummary?.output || {};
+    const compositePlan = compositeSummary?.plan || {};
+    const latestRollup = compositeSummary?.latest || null;
+    const sleepConsistencySd = compositeSummary?.sleepConsistencySd ?? null;
+
+    // Initialize convenience aliases and computed variables for render prep
+    const goals = USER_GOALS || {};
+    const report = reportPayload;
+    
+    const sleepConsistencyLabel = sleepConsistency?.label ?? 'Data Gaps';
+    const sleepStatusClass = getStatusClass_(sleepConsistencyLabel);
+    
+    const strengthAcwr = ds?.load?.acwr ?? {};
+    const acwrValue = strengthAcwr.value ?? strengthAcwr.ratio ? Number(strengthAcwr.value ?? strengthAcwr.ratio) : null;
+    const acwrDisplay = acwrValue != null ? `${acwrValue.toFixed(2)}${strengthAcwr.label ? ` (${strengthAcwr.label})` : ''}` : (strengthAcwr.label || 'Data Gaps');
+    const acwrLoadPct = parseSignedNumber_(ds?.load?.pctTrendStr);
+    
+    const rhrDeltaText = ds?.rhr?.deltaTrendStr ?? '—';
+    const rhrDeltaValue = parseSignedNumber_(rhrDeltaText);
+    
+    const loadTrendValue = trend.trainingLoad;
+    const loadGoalValue = goals.weeklyTrainingLoad || null;
+    const stepsTrendValue = trend.steps;
+    const floorTarget = Math.max(CONFIG.Steps.purpleMinDays, goals.stepsFloorDays || CONFIG.Steps.fallbackFloorDays);
+    
+    // Bucket scores
+    const bucketScoresMeta = report?.metadata?.bucketScores || {};
+    const sleepBucketScore = bucketScoresMeta.sleep || scoreSleepBucket_({
+      sleepThisWeek: weekly.sleep,
+      sleepGoal: goals.sleepMinutes || null,
+      sdMinutes: sleepConsistencySd,
+      rhrDelta: rhrDeltaValue
+    });
+    const loadBucketScore = bucketScoresMeta.load || scoreLoadBucket_({
+      acwr: acwrValue,
+      loadPctVsTrend: acwrLoadPct
+    });
+    const activityBucketScore = bucketScoresMeta.activity || scoreActivityBucket_({
+      stepsThisWeek: weekly.steps,
+      stepsGoal: goals.steps || null,
+      floorDays: ds?.steps?.days6k ?? null,
+      floorTarget
+    });
+    const workBucketScore = bucketScoresMeta.work || scoreWorkBucket_({
+      hoursThisWeek: weekly.workHours,
+      hoursGoal: goals.weeklyWorkHours || null,
+      deepWorkPct: ds?.work?.deepWorkPct ?? null
+    });
+    
+    // Ensure bucket scores have all necessary properties
+    const ensureBucketGrades = (bucket) => {
+      if (!bucket.grade) {
+        const info = gradeFromScore_(bucket.score);
+        bucket.grade = info.grade;
+        bucket.band = info.band;
+        bucket.bandClass = bandToStatusClass_(info.band);
+        bucket.bandLabel = bandToLabel_(info.band);
+        bucket.scoreText = bucket.score != null ? `${bucket.score}/100` : '';
+      }
+      return bucket;
+    };
+    [sleepBucketScore, loadBucketScore, activityBucketScore, workBucketScore].forEach(ensureBucketGrades);
+    
+    // Acute deltas
+    const sleepAcuteDiff = (weekly.sleep != null && trend.sleep != null) ? weekly.sleep - trend.sleep : null;
+    const activityAcuteDiff = parseSignedNumber_(ds?.steps?.pctTrendStr);
+    const workAcuteDiff = parseSignedNumber_(ds?.work?.pctTrendStr);
+    const loadAcuteDiff = acwrLoadPct != null && isFinite(acwrLoadPct) ? acwrLoadPct : null;
+    
+    // Score maps
+    const bucketScoreMap = {
+      sleep: sleepBucketScore,
+      load: loadBucketScore,
+      activity: activityBucketScore,
+      work: workBucketScore
+    };
+    const acuteMap = {
+      sleep: sleepAcuteDiff,
+      load: loadAcuteDiff,
+      activity: activityAcuteDiff,
+      work: workAcuteDiff
+    };
+
+    const readinessPctValue = readinessTileData.pct != null ? Math.round(readinessTileData.pct) : null;
+    const outputPctValue = outputTileData.pct != null ? Math.round(outputTileData.pct) : null;
+    const dataGapsLatest = latestRollup && latestRollup.data_gaps != null ? Number(latestRollup.data_gaps) : null;
+    const insufficientGlobal = dataGapsLatest != null && dataGapsLatest >= 5;
+
+    const readinessTrendValue = readinessTileData.trend != null ? readinessTileData.trend : null;
+    const outputTrendValue = outputTileData.trend != null ? outputTileData.trend : null;
+    const readinessTrendDisplay = !insufficientGlobal && readinessTrendValue != null ? formatTrendArrow_(readinessTrendValue) : '—';
+    const outputTrendDisplay = !insufficientGlobal && outputTrendValue != null ? formatTrendArrow_(outputTrendValue) : '—';
+    const readinessSubtitle = readinessTileData.subtitle || 'Readiness data missing — log recovery inputs.';
+    const outputSubtitle = outputTileData.subtitle || 'Output data missing — keep execution logs.';
+    const planNarrativeLine = compositePlan.narrative
+      || buildPlanSummaryText_(readinessPctValue, outputPctValue, readinessTrendValue, outputTrendValue, compositePlan.balance)
+      || 'Maintain current workload and protect bedtime/wake windows.';
+
+    // Validate that builder functions have sufficient data
+    if (!weekly || !trend || !goals || !ds) {
+      logWeeklyJob_('weekly_job:render_prep_missing_data', {
+        hasWeekly: !!weekly,
+        hasTrend: !!trend,
+        hasGoals: !!goals,
+        hasDs: !!ds
+      });
+      throw new Error('Cannot build driver cards: missing required data');
+    }
+
+    const driverData = buildSystemDriverCards_({
+      sleepFulfil: fmtFulfilment(fulfil.sleepPct),
+      sleepSdText: sleepConsistencySd != null ? fmtDurationMinutes_(sleepConsistencySd) : '',
+      sleepLabelClass: sleepStatusClass,
+      rhrDeltaText,
+      rhrDeltaValue,
+      sleepWeekly: weekly.sleep,
+      sleepTrend: trend.sleep,
+      sleepGoal: goals.sleepMinutes || null,
+      loadKgText: weekly.trainingLoad != null ? `${fmtInt(weekly.trainingLoad)} kg` : '',
+      acwrDisplay,
+      acwrValue,
+      loadPct: acwrLoadPct,
+      loadWeekly: weekly.trainingLoad,
+      loadTrend: loadTrendValue,
+      loadGoal: loadGoalValue,
+      prsThisWeek: weekly.prs,
+      stepsText: weekly.steps != null ? `${fmtSteps_(weekly.steps)} • ${fmtFulfilment(fulfil.fitnessPct)}` : '',
+      floorDaysValue: ds?.steps?.days6k ?? null,
+      floorTarget,
+      stepsDeltaPct: parseSignedNumber_(ds?.steps?.pctTrendStr),
+      stepsWeekly: weekly.steps,
+      stepsTrend: stepsTrendValue,
+      stepsGoal: goals.steps || null,
+      workHoursText: weekly.workHours != null ? `${Math.round(weekly.workHours)}h` : '',
+      workGoalText: goals.weeklyWorkHours ? `${Math.round(goals.weeklyWorkHours)}h` : '',
+      workTrendText: trend.workHours != null ? `${Math.round(trend.workHours)}h` : '',
+      workHoursValue: weekly.workHours,
+      workTrendValue: trend.workHours,
+      workGoalValue: goals.weeklyWorkHours || null,
+      bucketScores: bucketScoreMap,
+      acutes: acuteMap,
+      missingCounts: ds?.missing || {},
+      degradedMode: Boolean(report?.metadata?.degraded),
+      latestRollup,
+      insufficientNote: '— (insufficient data (Sat–Fri))'
+    });
+    const driverCards = driverData.cards;
+    const driverMissingNotes = driverData.missingNotes || [];
+
+    const componentRows = buildComponentRows_(weekly, trend, goals, ds, sleepConsistency, acwrValue, bucketScoreMap, acuteMap);
+
+    const degradeReasonFromReport = report.metadata?.degradeReason || '';
+
+    const planOriginalCode = (compositePlan.code || report.decision?.plan || 'Hold').toString();
+    const leverOriginal = report.decision?.lever || 'Maintain; keep steps steady';
+    const planLower = planOriginalCode.toLowerCase();
+    const ACWR_GATING_THRESHOLD = 1.5;
+    const gatingSleep = sleepStatusClass === 'status-warning' || sleepStatusClass === 'status-danger';
+    const gatingAcwr = acwrValue != null && acwrValue > ACWR_GATING_THRESHOLD;
+    let coercedPlan = planLower;
+    if (gatingAcwr) {
+      coercedPlan = 'recover';
+    } else if (gatingSleep && planLower === 'push') {
+      coercedPlan = 'hold';
+    }
+    const planDisplayMap = { push: 'PUSH', sustain: 'HOLD', hold: 'HOLD', deload: 'RECOVER', recover: 'RECOVER' };
+    const iconMap = { PUSH: '↑', HOLD: '↔', RECOVER: '↓' };
+    const planDisplay = planDisplayMap[coercedPlan] || planDisplayMap.sustain;
+    const planIcon = iconMap[planDisplay];
+
+    const gatingSummaryParts = [
+      sleepConsistencyLabel && `Sleep ${sleepConsistencyLabel}`,
+      sleepConsistencySd != null && `SD ${fmtDurationMinutes_(sleepConsistencySd)}`,
+      gatingAcwr && acwrValue != null && `ACWR ${acwrValue.toFixed(2)}`,
+      rhrDeltaText && rhrDeltaText !== '—' && `RHR Δ ${rhrDeltaText}`
+    ].filter(Boolean);
+    const gatingSummary = gatingSummaryParts.join(' · ');
+
+    const coachCallText = sanitizeTextForHtml_(report.coachCall || '', 400);
+    const coachNotes = sanitizeArrayForHtml_(report.decision?.notes || [], BULLET_CHAR_LIMIT);
+    let leverText = leverOriginal;
+    if (gatingAcwr && planDisplay === 'RECOVER') {
+      leverText = 'Reduce load 15–25%; prioritise recovery.';
+    } else if (gatingSleep && planDisplay === 'HOLD' && planLower === 'push') {
+      leverText = 'Stabilise sleep cadence before increasing load.';
+    }
+    const leverDisplay = sanitizeTextForHtml_(leverText, BULLET_CHAR_LIMIT);
+    const coachNotesList = coachNotes.slice();
+    if (coercedPlan !== planLower) {
+      coachNotesList.push(sanitizeTextForHtml_('Plan adjusted due to gating metrics.', BULLET_CHAR_LIMIT));
+    }
+    const bulletTags = ['Energy', 'Recovery', 'Behavior'];
+    const coachBullets = (report.recommendations || []).slice(0, 3).map((item, index) => ({
+      tag: escapeHtml_(bulletTags[index] || 'Focus'),
+      text: sanitizeTextForHtml_(item, RECOMMENDATION_CHAR_LIMIT)
+    }));
+
+    const coachContext = buildCoachContext_({
+      planDisplay,
+      planOriginalCode,
+      planNarrativeLine,
+      leverDisplay,
+      decision: report.decision,
+      sleepBucketScore,
+      loadBucketScore,
+      activityBucketScore,
+      workBucketScore,
+      derivedStats,
+      capacity,
+      sleepConsistency,
+      acwrLabel: strengthAcwr.label,
+      gatingSummary,
+      degradeReason: reportDegradeReason
+    });
+
+    stage = 'render';
+    logWeeklyJob_('weekly_job:stage', { stage });
+    const finalReport = reportPayload;
+    const coachRead = finalReport.coachRead || generateCoachRead_(coachContext);
+    finalReport.coachRead = coachRead;
+    finalReport.prose = coachReadToProse_(coachRead);
+    if (finalReport.metadata.totalBucketScore == null) finalReport.metadata.totalBucketScore = totalBucketScore;
+    if (!finalReport.metadata.totalGrade) finalReport.metadata.totalGrade = totalGradeInfo.grade;
+    if (!finalReport.metadata.totalBand) finalReport.metadata.totalBand = totalGradeInfo.band;
+    const safeReport = sanitizeReportForHtml_(finalReport);
+    const coachReadSafe = safeReport.coachRead || null;
+    const degradeReasonMeta = finalReport.metadata.degradeReason || '';
+    const showDegradeBanner = finalReport.metadata.degraded && !/coach_call_missing/i.test(degradeReasonMeta);
+    const degradeBannerMsg = showDegradeBanner ? 'AI content degraded this week (schema fail)' : '';
+
+    const gaps = [];
+    if (derivedStats.missing.activity) gaps.push(`${derivedStats.missing.activity} missing (Activity)`);
+    if (derivedStats.missing.sleep) gaps.push(`${derivedStats.missing.sleep} (Sleep)`);
+    if (derivedStats.missing.rhr) gaps.push(`${derivedStats.missing.rhr} (RHR)`);
+    const gapsNoteMsg = gaps.length ? `Data Gaps: ${gaps.join('; ')} — trends may be noisy.` : '';
+
+    // Compute email heading for logging
+    const headingLabel = weekMeta?.label || `Week of ${formatDateIso_(new Date())}`;
+    const totalScore = finalReport?.metadata?.totalBucketScore != null ? finalReport.metadata.totalBucketScore : null;
+    const totalScoreDisplay = totalScore != null ? `${totalScore}` : (scores.overall != null ? `${Math.round(scores.overall)}` : '—');
+    const heading = `${headingLabel} — (${totalScoreDisplay}/100) Health Score`;
+
+    Logger.log(`Stage before send: ${stage}`);
+    Logger.log(`Remaining quota: ${MailApp.getRemainingDailyQuota()}`);
+    Logger.log('Sending coach report email…');
+    const usedFallback = Boolean(!aiParseOk || degradeReasons.length || finalReport.metadata.degraded);
+    const emailLogMeta = {
+      aiParseOk,
+      usedFallback,
+      schemaDiag: schemaDiag || finalReport.metadata.degradeReason || 'ok',
+      aiParseError
+    };
+
+    // Create renderContext with all precomputed render variables
+    const renderContext = {
+      driverCards,
+      componentRows,
+      readinessPctValue,
+      outputPctValue,
+      readinessTrendDisplay,
+      readinessSubtitle,
+      outputTrendDisplay,
+      outputSubtitle,
+      planNarrativeLine,
+      planIcon,
+      coachCallText,
+      coachNotes,
+      leverDisplay,
+      coachNotesList,
+      coachBullets,
+      coachReadSafe,
+      gatingSummary,
+      gatingSleep,
+      degradeReason: degradeReasonFromReport,
+      planDisplay,
+      gatingAcwr,
+      insufficientGlobal,
+      latestRollup,
+      driverMissingNotes,
+      sleepConsistencyLabel,
+      sleepConsistencySd,
+      acwrValue,
+      strengthAcwr,
+      rhrDeltaText,
+      sleepConsistency
+    };
+
+    logWeeklyJob_('weekly_job:email_send_start', {
+      heading,
+      degraded: finalReport.metadata.degraded,
+      degradeReason: finalReport.metadata.degradeReason || ''
+    });
+    distributeReport(safeReport, scores, weekly, trend, USER_GOALS, [], derivedStats, capacity, decision, gapsNoteMsg, degradeBannerMsg, weekMeta, compositeSummary, emailLogMeta, renderContext);
+    logWeeklyJob_('weekly_job:email_send_complete', { heading });
+
+    stage = 'log';
+    logWeeklyJob_('weekly_job:stage', { stage });
+    logReportToSheet(aiResponseText, weekly, trend, scores, weekMeta);
+    logWeeklyJob_('weekly_job:log_sheet_row_appended', { week: weekMeta?.label || 'unknown' });
+
+  } catch (error) {
+    logWeeklyJob_('weekly_job:error', { stage, message: error?.message || 'unknown', stack: error?.stack || 'n/a' });
+    sendJobFailureEmail_(weekMeta, stage, error);
+    throw error;
+  } finally {
+    logWeeklyJob_('weekly_job:finally', { stage });
+    setWeekReferenceOverride(null);
+  }
+}
+
+
+// --- Performance Index (unchanged math) ---
+function calculatePerformanceIndex(weekly, trend, goals){
+  const hoursEff = Math.min(weekly.workHours || 0, CONFIG.Work.extremeHours);
+  const workScore = scale(hoursEff / Math.max(1, goals.weeklyWorkHours));
+  const loadGoalScore  = scale((weekly.trainingLoad || 0) / Math.max(1, goals.weeklyTrainingLoad));
+  const loadTrendScore = scale((weekly.trainingLoad || 0) / Math.max(1, trend.trainingLoad || 1));
+  const prBoost = Math.min((weekly.prs || 0) * 2, 6);
+  const strengthScore = Math.min(100, Math.round(0.6 * loadGoalScore + 0.4 * loadTrendScore + prBoost));
+  const stepScore = scale((weekly.steps || 0) / Math.max(1, goals.steps));
+  const days6k = countDaysMeetingFloor_('steps', goals.stepsFloor || CONFIG.Steps.fallbackFloor);
+  const fitnessScore = Math.min(100, stepScore + (days6k >= (goals.stepsFloorDays||5) ? 5 : 0));
+  const PI = Math.round(0.4 * workScore + 0.4 * strengthScore + 0.2 * fitnessScore);
+  return { PI, components: { workScore, strengthScore, fitnessScore, loadGoalScore, loadTrendScore, prBoost, days6k } };
+}
+
+// --- Capacity classifier with Purple ---
+function classifyCapacityWithPurple(weekly, trend, goals, ds){
+  const sleepDefMin = Math.max(0, (goals.sleepMinutes || 0) - (weekly.sleep || 0));
+  const rhrDelta    = (weekly.rhr || 0) - (trend.rhr || weekly.rhr || 0);
+  const loadRatio   = (weekly.trainingLoad || 0) / Math.max(1, trend.trainingLoad || 1);
+  const workHours   = weekly.workHours || 0;
+  const acwrRatio   = ds?.load?.acwr?.ratio ?? null;
+  const acwrValue   = ds?.load?.acwr?.value ?? null;
+  const acwrDisplay = acwrValue != null ? acwrValue : acwrRatio;
+  const sriScore    = ds?.sleep?.consistency?.score ?? null;
+
+  let red = 0, amber = 0; const reasons = [];
+
+  if (sleepDefMin >= CONFIG.Sleep.deficitRed) { red++;   reasons.push(`Sleep −${fmtHMin(sleepDefMin)}`); }
+  else if (sleepDefMin >= CONFIG.Sleep.deficitAmber) { amber++; reasons.push(`Sleep −${fmtHMin(sleepDefMin)}`); }
+
+  if (rhrDelta >= CONFIG.RHR.redDelta) { red++;   reasons.push(`RHR +${fmtBpm(rhrDelta)} vs 4-wk`); }
+  else if (rhrDelta >= CONFIG.RHR.amberDelta) { amber++; reasons.push(`RHR +${fmtBpm(rhrDelta)} vs 4-wk`); }
+
+  if (acwrRatio != null){
+    if (acwrRatio >= CONFIG.ACWR.red) { red++; reasons.push(`ACWR high (${fmtAcwr(acwrDisplay)})`); }
+    else if (acwrRatio >= CONFIG.ACWR.amber) { amber++; reasons.push(`ACWR rising (${fmtAcwr(acwrDisplay)})`); }
+  }
+
+  if (sriScore != null){
+    if (sriScore < CONFIG.Sleep.consistencyRed) { red++; reasons.push(`SRI low (${sriScore}/100)`); }
+    else if (sriScore < CONFIG.Sleep.consistencyAmber) { amber++; reasons.push(`SRI drifting (${sriScore}/100)`); }
+  }
+
+  if (loadRatio >= CONFIG.ACWR.highLoad) { red++;   reasons.push(`Load +${Math.round((loadRatio-1)*100)}% vs 4-wk`); }
+  else if (loadRatio >= CONFIG.Load.amberRatio) { amber++; reasons.push(`Load +${Math.round((loadRatio-1)*100)}%`); }
+
+  if (workHours >= CONFIG.Work.plateauHours) { amber++; reasons.push(`Work ${Math.round(workHours)}h (near plateau)`); }
+
+  if (acwrRatio != null && acwrRatio >= CONFIG.ACWR.red && ((sriScore != null && sriScore < CONFIG.Sleep.consistencyRed) || rhrDelta >= CONFIG.RHR.redDelta)) {
+    if (!reasons.includes('ACWR spike + fatigue')) reasons.push('ACWR spike + fatigue');
+    return { label: 'Red', reasons };
+  }
+
+  const underWork = (goals.weeklyWorkHours ? workHours <= CONFIG.Work.purpleGoalRatio * goals.weeklyWorkHours : false) && workHours < CONFIG.Work.plateauHours;
+  const underLoad = (trend.trainingLoad ? (weekly.trainingLoad || 0) <= CONFIG.Work.purpleGoalRatio * trend.trainingLoad : false);
+  const lowSteps  = ds.steps.days6k < CONFIG.Steps.purpleMinDays;
+  const couldBePurple = (underWork && underLoad) || (underWork && lowSteps) || (underLoad && lowSteps);
+  const sleepOkForPurple = (sleepDefMin < CONFIG.Sleep.purpleMaxDeficit) && (sriScore == null || sriScore >= CONFIG.Sleep.consistencyAmber);
+  const acwrOkForPurple = (acwrRatio == null || acwrRatio <= CONFIG.ACWR.purpleMax);
+
+  if (red >= 2) return { label: 'Red', reasons };
+  if (red === 1 || amber >= 1) return { label: 'Amber', reasons };
+  if (sleepOkForPurple && acwrOkForPurple && couldBePurple) return { label: 'Purple', reasons: ['Under capacity—low work & training/NEAT'] };
+  if (couldBePurple && !sleepOkForPurple) reasons.push('Sleep rhythm unstable');
+  return { label: 'Green', reasons };
+}
+
+
+// --- Decision rule (Push / Sustain / Deload + lever) ---
+function decideNextAction(weekly, trend, goals, ds, capacity){
+  const sleepDefMin = Math.max(0, (goals.sleepMinutes || 0) - (weekly.sleep || 0));
+  const rhrDelta    = (weekly.rhr || 0) - (trend.rhr || weekly.rhr || 0);
+  const loadRatio   = (weekly.trainingLoad || 0) / Math.max(1, trend.trainingLoad || 1);
+  const workEff     = Math.min(weekly.workHours || 0, CONFIG.Work.extremeHours);
+  const acwrRatio   = ds?.load?.acwr?.ratio ?? null;
+  const acwrValue   = ds?.load?.acwr?.value ?? null;
+  const acwrDisplay = acwrValue != null ? acwrValue : acwrRatio;
+  const sriScore    = ds?.sleep?.consistency?.score ?? null;
+
+  const canPush = (workEff < CONFIG.Work.extremeHours)
+    && (sleepDefMin < CONFIG.Sleep.pushDeficitMax)
+    && (rhrDelta <= CONFIG.RHR.amberDelta)
+    && (acwrRatio == null || acwrRatio <= CONFIG.ACWR.amber)
+    && (sriScore == null || sriScore >= CONFIG.Sleep.consistencyAmber);
+
+  if (canPush && (capacity.label === 'Green' || capacity.label === 'Purple')) {
+    const lever = (capacity.label === 'Purple')
+      ? 'Use slack: add ~10% training load and one quality session'
+      : 'Controlled push: +8% load while keeping sleep 7h+';
+    return { plan: 'Push', lever };
+  }
+
+  const spike = acwrRatio != null && acwrRatio >= CONFIG.ACWR.red;
+  if (spike && ((sriScore != null && sriScore < CONFIG.Sleep.consistencyRed) || sleepDefMin >= CONFIG.Sleep.deficitAmber || rhrDelta >= CONFIG.RHR.redDelta)) {
+    return { plan: 'Deload', lever: 'ACWR spike — trim 20% volume and add 60m sleep' };
+  }
+
+  const redish = (sleepDefMin >= CONFIG.Sleep.purpleMaxDeficit) + (rhrDelta >= CONFIG.RHR.redDelta) + (loadRatio >= CONFIG.ACWR.highLoad) + (workEff >= CONFIG.Work.extremeHours)
+    + (sriScore != null && sriScore < CONFIG.Sleep.severeConsistency) + (acwrRatio != null && acwrRatio >= CONFIG.ACWR.red);
+  if (redish >= 2 || capacity.label === 'Red') {
+    return { plan: 'Deload', lever: 'Reduce load 15–25%; prioritise sleep consistency and HR recovery' };
+  }
+
+  const acwrCaution = acwrRatio != null && acwrRatio > CONFIG.ACWR.amber;
+  if (acwrCaution || (sriScore != null && sriScore < CONFIG.Sleep.consistencyAmber) || sleepDefMin >= CONFIG.Sleep.deficitAmber) {
+    const lever = (sleepDefMin >= CONFIG.Sleep.deficitAmber)
+      ? 'Hold load; add 45–60m nightly sleep before next push'
+      : (sriScore != null && sriScore < CONFIG.Sleep.consistencyAmber)
+        ? 'Stabilise bedtime/wake; keep load flat until SRI ≥70'
+        : `Bank this week; let ACWR fall below ${fmtAcwr(CONFIG.ACWR.purpleMax)} (currently ${fmtAcwr(acwrDisplay)})`;
+    return { plan: 'Sustain', lever };
+  }
+
+  return { plan: 'Sustain', lever: 'Maintain; keep steps steady' };
+}
+
+
+// --- Score helpers (existing) ---
+function scoreFromTarget_(value, target, betterIsLower=false){
+  if (value == null || target == null) return 0;
+  let ratio = betterIsLower ? (target / Math.max(value, 1)) : (value / Math.max(target, 1));
+  let score = Math.min(1.2, Math.max(0, ratio)) * 100;
+  return Math.round(Math.min(score, 100));
+}
+function getTrendArrow(current, trend) { if (current > trend) return '⬆️'; if (current < trend) return '⬇️'; return '➡️'; }
+
+function fmtAcwr(value){
+  if (value == null || value === '' || !isFinite(Number(value))) return '—';
+  return Number(value).toFixed(1);
+}
+
+function fmtFulfilment(value){
+  if (value == null || isNaN(value)) return '—';
+  return `${value}%`;
+}
+
+function bulletListHtml(items){
+  if (!items || !items.length) return '';
+  const filtered = items.filter(Boolean);
+  if (!filtered.length) return '';
+  return `<ul style="margin:0 0 12px 18px;padding-left:18px;">${filtered.map(i => `<li>${i}</li>`).join('')}</ul>`;
+}
+
+const SECTION_CONFIG = {
+  work: { label: 'Work hours', unit: 'hours', betterIsLower: false },
+  strength: { label: 'Strength training load', unit: 'kilograms', betterIsLower: false },
+  fitness: { label: 'Daily movement', unit: 'steps', betterIsLower: false },
+  sleep: { label: 'Sleep duration', unit: 'minutes', betterIsLower: false },
+  readiness: { label: 'Readiness (resting heart rate)', unit: 'beats per minute', betterIsLower: true }
+};
+
+const SECTION_LABEL_SHORT = {
+  work: 'Work',
+  strength: 'Strength',
+  fitness: 'Movement',
+  sleep: 'Sleep',
+  readiness: 'Readiness'
+};
+
+const ACTION_LIBRARY = {
+  work: {
+    green: 'Keep the work rhythm steady.',
+    yellow_high: 'Trim work hours a little to protect recovery.',
+    yellow_low: 'Add a focused block to close the work gap.',
+    red_high: 'Pull hours back to avoid burnout.',
+    red_low: 'Schedule firm focus time to meet commitments.',
+    unknown: 'Note work hours so we can steer next week.',
+    noGoal: 'Set a weekly work target to guide decisions.'
+  },
+  strength: {
+    green: 'Maintain the current training mix.',
+    yellow_high: 'Dial volume down slightly to bank recovery.',
+    yellow_low: 'Add one quality strength session to keep load on track.',
+    red_high: 'Deload strength volume this week.',
+    red_low: 'Plan progressive overload to build toward the goal.',
+    unknown: 'Log strength sessions so we can steer the load.',
+    noGoal: 'Set a weekly load target (or proxy) to direct training.'
+  },
+  fitness: {
+    green: 'Keep daily movement habits steady.',
+    yellow_high: 'Channel extra steps into easy aerobic sessions.',
+    yellow_low: 'Layer in walks to close the movement gap.',
+    red_high: 'Hold steps steady and make recovery intentional.',
+    red_low: 'Prioritise daily walks to meet the movement goal.',
+    unknown: 'Track step counts consistently to steer movement.',
+    noGoal: 'Set a daily movement goal to guide choices.'
+  },
+  sleep: {
+    green: 'Keep bedtime and wake routines consistent.',
+    yellow_high: 'Use the extra rest to fuel deliberate training.',
+    yellow_low: 'Bring lights-out forward to protect sleep time.',
+    red_high: 'Hold a firm wake-up time so sleep stays purposeful.',
+    red_low: 'Block non-negotiable wind-down time to recover.',
+    unknown: 'Log sleep duration so we can adjust quickly.',
+    noGoal: 'Set a nightly sleep target to anchor recovery.'
+  },
+  readiness: {
+    green: 'Keep recovery practices consistent.',
+    yellow_high: 'Ease up slightly and watch recovery markers.',
+    yellow_low: 'You are trending better than goal, stay patient with buildup.',
+    red_high: 'Heart rate is well below goal; build gradually while monitoring.',
+    red_low: 'Prioritise rest until heart rate settles.',
+    unknown: 'Track resting heart rate to steer readiness.',
+    noGoal: 'Add a resting heart rate goal to guide recovery.'
+  }
+};
+
+const ACTION_WHERE_HOW = {
+  work: 'via two 90-minute focus sprints',
+  strength: 'via the main lifts; tempo 3-1-0',
+  fitness: 'via two purposeful walks (20 minutes each)',
+  sleep: 'via a fixed 10:00pm wind-down routine',
+  readiness: 'via five-minute evening parasympathetic breathing'
+};
+
+const ACTION_DEDUP_FALLBACK = {
+  work: {
+    green: 'Keep work cadence steady to preserve bandwidth.',
+    yellow_high: 'Ease workload slightly to free recovery space.',
+    yellow_low: 'Add one deliberate focus block to close the work gap.',
+    red_high: 'Cut back hours sharply so fatigue drops.',
+    red_low: 'Bookend deep-work blocks to rebuild momentum.',
+    default: 'Rebalance workload deliberately.'
+  },
+  strength: {
+    green: 'Hold the current strength mix steady.',
+    yellow_high: 'Dial strength volume down to bank recovery.',
+    yellow_low: 'Layer one quality strength session to lift the load.',
+    red_high: 'Deload strength sets while monitoring fatigue.',
+    red_low: 'Plan progressive overload carefully to rebuild.',
+    default: 'Tune strength load deliberately.'
+  },
+  fitness: {
+    green: 'Keep daily movement habits steady.',
+    yellow_high: 'Channel surplus steps into easy aerobic time.',
+    yellow_low: 'Layer extra walks to close the movement gap.',
+    red_high: 'Hold step volume steady so recovery settles.',
+    red_low: 'Prioritise daily walks to rebuild momentum.',
+    default: 'Adjust movement deliberately.'
+  },
+  sleep: {
+    green: 'Keep bedtime cadence consistent.',
+    yellow_high: 'Use the extra rest intentionally for the training plan.',
+    yellow_low: 'Bring lights-out forward to protect sleep time.',
+    red_high: 'Hold a firm wake window so sleep stays purposeful.',
+    red_low: 'Block a non-negotiable wind-down to recover.',
+    default: 'Adjust sleep rhythm deliberately.'
+  },
+  readiness: {
+    green: 'Keep recovery practices steady.',
+    yellow_high: 'Ease effort slightly and monitor signals.',
+    yellow_low: 'Stay patient with the positive recovery trend.',
+    red_high: 'Build gradually while you watch heart rate.',
+    red_low: 'Prioritise rest until heart rate settles.',
+    default: 'Adjust recovery deliberately.'
+  }
+};
+
+function getBandVariantKey(band) {
+  if (!band) return 'default';
+  if (band === 'green') return 'green';
+  if (band === 'unknown') return 'default';
+  if (band.startsWith('yellow_high')) return 'yellow_high';
+  if (band.startsWith('yellow_low')) return 'yellow_low';
+  if (band.startsWith('red_high')) return 'red_high';
+  if (band.startsWith('red_low')) return 'red_low';
+  return 'default';
+}
+
+function appendWhereHowClause(sentence, clause) {
+  if (!sentence) return '';
+  const base = sentence.trim().replace(/\s+$/, '');
+  const trimmed = base.replace(/\.+$/, '');
+  if (!clause) return `${trimmed}.`;
+  const cleanedClause = clause.trim().replace(/\.$/, '');
+  return `${trimmed} ${cleanedClause}.`;
+}
+
+function describeGoalStatus(fulfilPct, betterIsLower) {
+  if (fulfilPct == null || isNaN(fulfilPct)) return null;
+  const diff = fulfilPct - 100;
+  const effectiveDiff = betterIsLower ? -diff : diff;
+  const magnitude = Math.abs(effectiveDiff);
+  if (magnitude <= 3) return 'on goal';
+  if (magnitude <= 7) return effectiveDiff > 0 ? 'slightly ahead of goal' : 'slightly behind goal';
+  if (magnitude <= 12) return effectiveDiff > 0 ? 'ahead of goal' : 'behind goal';
+  return effectiveDiff > 0 ? 'well ahead of goal' : 'well behind goal';
+}
+
+function buildStatusSentence(sectionKey, cfg, options = {}) {
+  const { weeklyValue, goalValue, fulfilPct, extra } = options;
+  const label = cfg ? cfg.label : sectionKey;
+  const betterIsLower = cfg ? cfg.betterIsLower : false;
+  const goalDescriptor = extra && extra.goalDescriptor ? extra.goalDescriptor : 'goal';
+  const status = describeGoalStatus(fulfilPct, betterIsLower);
+  if (goalValue && status) {
+    return `${label} lands ${status} at ${percentAsText(fulfilPct)} of the ${goalDescriptor}.`;
+  }
+  if (goalValue && weeklyValue != null) {
+    return `${label} progress tracks the ${goalDescriptor}; percent insight is limited this week.`;
+  }
+  if (weeklyValue != null) {
+    return `${label} logged ${formatSectionValue(sectionKey, weeklyValue)} with no goal for comparison.`;
+  }
+  return `${label} data is missing this week.`;
+}
+
+function normalizeComparisonText(text) {
+  return (text || '').toLowerCase().replace(/[^a-z0-9\s]/g, ' ').replace(/\s+/g, ' ').trim();
+}
+
+function isDuplicateWithRecommendations(sentence, recommendations) {
+  if (!sentence || !Array.isArray(recommendations) || !recommendations.length) return false;
+  const actionNorm = normalizeComparisonText(sentence);
+  if (!actionNorm) return false;
+  return recommendations.some(rec => {
+    const recNorm = normalizeComparisonText(rec);
+    if (!recNorm) return false;
+    const shorter = actionNorm.length <= recNorm.length ? actionNorm : recNorm;
+    const longer = actionNorm.length <= recNorm.length ? recNorm : actionNorm;
+    if (!shorter) return false;
+    if (!longer.includes(shorter)) return false;
+    return (shorter.length / Math.max(longer.length, 1)) >= 0.8;
+  });
+}
+
+function buildCoachContext_(options) {
+  const {
+    planDisplay,
+    planOriginalCode,
+    planNarrativeLine,
+    leverDisplay,
+    decision,
+    sleepBucketScore,
+    loadBucketScore,
+    activityBucketScore,
+    workBucketScore,
+    derivedStats,
+    capacity,
+    sleepConsistency,
+    acwrLabel,
+    gatingSummary,
+    degradeReason
+  } = options || {};
+
+  const ds = derivedStats || {};
+  const missing = ds.missing || {};
+  const coachGapFlags = [];
+  if (missing.activity) coachGapFlags.push('activity logging patchy');
+  if (missing.sleep) coachGapFlags.push('sleep records patchy');
+  if (missing.rhr) coachGapFlags.push('resting heart entries patchy');
+  if (!coachGapFlags.length) coachGapFlags.push('data coverage steady');
+
+  const safePlan = String(planDisplay || planOriginalCode || decision?.plan || '').toLowerCase();
+  const safeLever = String(leverDisplay || decision?.lever || '').replace(/\d+/g, 'many');
+  const safeNarrative = String(planNarrativeLine || '').replace(/\d+/g, 'many');
+  const safeCapacityReasons = (capacity?.reasons || []).map(reason => String(reason || '').replace(/\d+/g, 'many'));
+
+  return {
+    plan: safePlan,
+    planLever: safeLever,
+    narrative: safeNarrative,
+    sleepStatus: String(sleepBucketScore?.bandLabel || '').toLowerCase(),
+    sleepTrend: describeTrendWord_(ds?.sleep?.pctTrendStr),
+    loadStatus: String(loadBucketScore?.bandLabel || '').toLowerCase(),
+    loadTrend: describeTrendWord_(ds?.load?.pctTrendStr),
+    stepsStatus: String(activityBucketScore?.bandLabel || '').toLowerCase(),
+    stepsTrend: describeTrendWord_(ds?.steps?.pctTrendStr),
+    workStatus: String(workBucketScore?.bandLabel || '').toLowerCase(),
+    workTrend: describeTrendWord_(ds?.work?.pctTrendStr),
+    sleepConsistencyLabel: String(sleepConsistency?.label || '').toLowerCase(),
+    acwrLabel: String(acwrLabel || '').toLowerCase(),
+    capacityLabel: String(capacity?.label || '').toLowerCase(),
+    capacityReasons: safeCapacityReasons,
+    dataFlags: coachGapFlags,
+    gatingSummary: String(gatingSummary || '').replace(/\d+/g, 'many'),
+    degradeFlag: String(degradeReason || '').replace(/\d+/g, 'many')
+  };
+}
+
+function describeTrendWord_(value) {
+  if (!value) return 'steady';
+  const normalised = String(value).toLowerCase();
+  if (/[+]|\b(up|rise|lift)/.test(normalised)) return 'improving';
+  if (/[-]|\b(down|drop|slide)/.test(normalised)) return 'sliding';
+  return 'steady';
+}
+
+function parseCoachReadJson_(rawText) {
+  const snippet = extractJsonFromText_(rawText);
+  if (!snippet) return null;
+  try {
+    return JSON.parse(snippet);
+  } catch (err) {
+    console.error('CoachRead JSON parse failed', err);
+    return null;
+  }
+}
+
+function normaliseCoachRead_(data) {
+  if (!data || typeof data !== 'object') return null;
+  const normalizeList = key => {
+    const list = Array.isArray(data[key]) ? data[key] : [];
+    return list
+      .map(item => (typeof item === 'string' ? item.trim() : ''))
+      .filter(Boolean);
+  };
+  return {
+    whereYoureAt: normalizeList('whereYoureAt'),
+    nextOrders: normalizeList('nextOrders'),
+    tradeOffs: normalizeList('tradeOffs'),
+    gutChecks: normalizeList('gutChecks')
+  };
+}
+
+function validateCoachRead_(coachRead) {
+  if (!coachRead) return false;
+  const sections = ['whereYoureAt', 'nextOrders', 'tradeOffs', 'gutChecks'];
+  return sections.every(section => {
+    const lines = coachRead[section];
+    if (!Array.isArray(lines) || !lines.length) return false;
+    return lines.every(line => typeof line === 'string' && line.length && !COACH_READ_BANNED_REGEX.test(line));
+  });
+}
+
+function fallbackCoachRead_(context) {
+  const plan = (context?.plan || 'Hold').toLowerCase();
+  const sleepStatus = (context?.sleepStatus || 'steady').toLowerCase();
+  const loadStatus = (context?.loadStatus || 'steady').toLowerCase();
+  const stepsStatus = (context?.stepsStatus || 'steady').toLowerCase();
+  const workStatus = (context?.workStatus || 'steady').toLowerCase();
+
+  const tonePrefix = plan === 'push'
+    ? 'You pushed tempo, mate.'
+    : plan === 'recover'
+      ? 'You kept the brakes on, mate.'
+      : 'You held the line, mate.';
+
+  const where = [
+    `${tonePrefix}`,
+    `Sleep feels ${sleepStatus} and load sits ${loadStatus}.`,
+    `Steps read ${stepsStatus} while work feels ${workStatus}.`
+  ];
+
+  const nextOrders = plan === 'recover'
+    ? [
+        'Keep sessions light and clean.',
+        'Lock lights-out before you drift.',
+        'Log recovery notes straight after dinner.'
+      ]
+    : plan === 'push'
+      ? [
+          'Add a quality effort only after prep is squared away.',
+          'Guard your wind-down like kit.',
+          'Check the log each night and tighten form.'
+        ]
+      : [
+          'Hold your training rhythm without freelancing.',
+          'Protect the same wake window every morning.',
+          'Note one win and one gap before rack time.'
+        ];
+
+  const tradeOffs = [
+    'More load means less tolerance for loose sleep.',
+    'Pushing steps will steal focus unless you plan the day.',
+    'Extra work blocks need matching recovery discipline.'
+  ];
+
+  const gutChecks = [
+    'Are you switching off when the schedule says lights-out?',
+    'Is your training log honest or dressed up?',
+    'Will you front the week without excuses?'
+  ];
+
+  return {
+    whereYoureAt: where,
+    nextOrders,
+    tradeOffs,
+    gutChecks
+  };
+}
+
+function coachReadToProse_(coachRead) {
+  if (!coachRead) return '';
+  const block = (title, lines) => {
+    if (!lines || !lines.length) return '';
+    return `${title}:\n${lines.join('\n')}`;
+  };
+  return [
+    block('Where You’re At', coachRead.whereYoureAt),
+    block('Next Orders', coachRead.nextOrders),
+    block('Plays You Can’t Have Both Ways', coachRead.tradeOffs),
+    block('Gut Checks', coachRead.gutChecks)
+  ].filter(Boolean).join('\n\n');
+}
+
+function renderCoachReadSection_(coachRead) {
+  if (!coachRead) return '';
+  const renderParagraphs = lines => (lines && lines.length) ? lines.map(line => `<p>${line}</p>`).join('') : '';
+  const renderList = lines => (lines && lines.length)
+    ? `<ul>${lines.map(line => `<li>${line}</li>`).join('')}</ul>`
+    : '';
+
+  return `
+    <section class="coach-read">
+      <h2>Coach&rsquo;s Read</h2>
+      <div class="coach-read-block">
+        <h3>Where You&rsquo;re At</h3>
+        ${renderParagraphs(coachRead.whereYoureAt)}
+      </div>
+      <div class="coach-read-block">
+        <h3>Next Orders</h3>
+        ${renderList(coachRead.nextOrders)}
+      </div>
+      <div class="coach-read-block">
+        <h3>Plays You Can&rsquo;t Have Both Ways</h3>
+        ${renderList(coachRead.tradeOffs)}
+      </div>
+      <div class="coach-read-block">
+        <h3>Gut Checks</h3>
+        ${renderList(coachRead.gutChecks)}
+      </div>
+    </section>
+  `;
+}
+
+function generateCoachRead_(context) {
+  try {
+    const prompt = buildCoachReadPrompt_(context);
+    const raw = callOpenAIChat_(prompt, { model: 'gpt-4-turbo', maxTokens: 400, temperature: 0.2 });
+    const parsed = normaliseCoachRead_(parseCoachReadJson_(raw));
+    if (validateCoachRead_(parsed)) {
+      return parsed;
+    }
+    console.warn('CoachRead validation failed, using fallback.');
+  } catch (error) {
+    console.error('CoachRead generation failed', error);
+  }
+  return fallbackCoachRead_(context);
+}
+
+function buildFallbackActionSentence(sectionKey, band) {
+  const variant = getBandVariantKey(band);
+  const fallbackMap = ACTION_DEDUP_FALLBACK[sectionKey] || {};
+  const base = fallbackMap[variant] || fallbackMap.default || 'Adjust this lever deliberately.';
+  return base.endsWith('.') ? base : `${base}.`;
+}
+
+function toPercentWord(text) {
+  if (!text) return '—';
+  return String(text).replace(/%/g, ' percent');
+}
+
+function percentAsText(pct){
+  if (pct == null || isNaN(pct)) return 'no percent insight';
+  const rounded = Math.round(pct);
+  return `${rounded} percent`;
+}
+
+function formatMinutesToWords(totalMinutes){
+  if (totalMinutes == null || isNaN(totalMinutes)) return 'no recorded minutes';
+  const minutes = Math.round(totalMinutes);
+  const hours = Math.floor(minutes / 60);
+  const mins = minutes % 60;
+  const parts = [];
+  if (hours) parts.push(`${hours} hour${hours === 1 ? '' : 's'}`);
+  if (mins) parts.push(`${mins} minute${mins === 1 ? '' : 's'}`);
+  if (!parts.length) parts.push('0 minutes');
+  return parts.join(' ');
+}
+
+function formatSectionValue(sectionKey, value){
+  if (value == null || value === '') return 'no data logged';
+  const numericValue = Number(value);
+  if (!isFinite(numericValue)) return 'no data logged';
+  switch (sectionKey) {
+    case 'work':
+      return `${(Math.round(numericValue * 10) / 10).toString()} hours`;
+    case 'strength':
+      return `${Math.round(numericValue).toLocaleString()} kilograms`;
+    case 'fitness':
+      return `${Math.round(numericValue).toLocaleString()} steps`;
+    case 'sleep':
+      return formatMinutesToWords(numericValue);
+    case 'readiness':
+      return `${Math.round(numericValue)} beats per minute`;
+    default:
+      return `${Math.round(numericValue)}`;
+  }
+}
+
+function buildActionSentence(sectionKey, band, hasGoal, betterIsLower){
+  const library = ACTION_LIBRARY[sectionKey] || {};
+  if (!hasGoal) return library.noGoal || 'Set a goal to guide next week.';
+  if (!band || band === 'unknown') return library.unknown || 'Track this metric to steer next steps.';
+  const base = library[band];
+  if (base) return base;
+  if (band.startsWith('yellow')) return betterIsLower ? (library.yellow_high || library.yellow_low) : (library.yellow_low || library.yellow_high) || library.green;
+  if (band.startsWith('red')) return betterIsLower ? (library.red_high || library.red_low) : (library.red_low || library.red_high) || library.yellow_low || library.red_low;
+  return library.green || 'Stay the course.';
+}
+
+function buildContextClause(sectionKey, context){
+  const { weeklyValue, trendValue, extra } = context;
+  switch (sectionKey) {
+    case 'work':
+      if (trendValue && weeklyValue >= trendValue * CONFIG.Trend.workHigh) {
+        return 'Work time beats the four week norm; protect recovery.';
+      }
+      break;
+    case 'strength':
+      if ((trendValue && weeklyValue >= trendValue * CONFIG.Trend.strengthHigh) || (extra && extra.acwrRatio && extra.acwrRatio >= CONFIG.ACWR.amber)) {
+        return 'Load tops four week average; keep next week easy.';
+      }
+      break;
+    case 'fitness':
+      if (trendValue && weeklyValue <= trendValue * CONFIG.Trend.fitnessLow) {
+        return 'Steps trail four week trend; plan extra walks.';
+      }
+      break;
+    case 'sleep':
+      if (extra && extra.sleepConsistencyScore != null && extra.sleepConsistencyScore < 65) {
+        return 'Sleep rhythm drifting; lock in lights-out times.';
+      }
+      if (trendValue && weeklyValue <= trendValue * CONFIG.Trend.sleepLow) {
+        return 'Sleep time dipped below trend; wind down earlier.';
+      }
+      break;
+    case 'readiness':
+      if (trendValue && weeklyValue >= trendValue + CONFIG.Trend.readinessHighDelta) {
+        return 'Heart rate trend climbing; schedule extra recovery.';
+      }
+      break;
+    default:
+      break;
+  }
+  return null;
+}
+
+function buildSectionNarrative(sectionKey, options, contextCollector, recommendations){
+  const cfg = SECTION_CONFIG[sectionKey];
+  const sentences = [];
+  let contextHighlight = null;
+  const { weeklyValue, goalValue, fulfilPct, band, trendValue, extra } = options || {};
+  const betterIsLower = cfg ? cfg.betterIsLower : false;
+
+  sentences.push(buildStatusSentence(sectionKey, cfg, options || {}));
+
+  const clause = ACTION_WHERE_HOW[sectionKey] || '';
+  let actionSentence = appendWhereHowClause(
+    buildActionSentence(sectionKey, band, Boolean(goalValue), betterIsLower),
+    clause
+  );
+
+  if (isDuplicateWithRecommendations(actionSentence, recommendations)) {
+    actionSentence = appendWhereHowClause(
+      buildFallbackActionSentence(sectionKey, band),
+      clause
+    );
+    if (isDuplicateWithRecommendations(actionSentence, recommendations)) {
+      actionSentence = appendWhereHowClause('Action: Follow this lever in a fresh way.', clause);
+    }
+  }
+
+  sentences.push(actionSentence);
+
+  const context = buildContextClause(sectionKey, { weeklyValue, trendValue, extra });
+  if (context) {
+    sentences.push(`Context: ${context}`);
+    contextHighlight = context;
+  }
+
+  if (contextHighlight && Array.isArray(contextCollector)) {
+    contextCollector.push({ section: SECTION_LABEL_SHORT[sectionKey] || sectionKey, message: contextHighlight });
+  }
+
+  return { text: sentences.join(' '), contextHighlight };
+}
+
+function composeBaselineSections_(weekly, trend, goals, ds, fulfil, bands, decision, recommendations){
+  const strengthAcwr = ds?.load?.acwr;
+  const sleepConsistency = ds?.sleep?.consistency || {};
+  const contextHighlights = [];
+
+  const activitySummary = buildSectionNarrative('work', {
+    weeklyValue: weekly.workHours,
+    goalValue: goals.weeklyWorkHours || null,
+    fulfilPct: fulfil.workPct,
+    band: bands.work,
+    trendValue: trend.workHours,
+    extra: {
+      acwrRatio: strengthAcwr?.ratio || strengthAcwr?.value || null
+    }
+  }, contextHighlights, recommendations);
+
+  const strengthGoalValue = goals.weeklyTrainingLoad || (fulfil.strengthProxyGoal ? trend.trainingLoad : null);
+  const strengthSummary = buildSectionNarrative('strength', {
+    weeklyValue: weekly.trainingLoad,
+    goalValue: strengthGoalValue,
+    fulfilPct: fulfil.strengthPct,
+    band: bands.strength,
+    trendValue: trend.trainingLoad,
+    extra: {
+      acwrRatio: strengthAcwr?.ratio || strengthAcwr?.value || null,
+      goalDescriptor: fulfil.strengthProxyGoal ? 'proxy goal (four week average)' : 'goal'
+    }
+  }, contextHighlights, recommendations);
+
+  const fitnessSummary = buildSectionNarrative('fitness', {
+    weeklyValue: weekly.steps,
+    goalValue: goals.steps || null,
+    fulfilPct: fulfil.fitnessPct,
+    band: bands.fitness,
+    trendValue: trend.steps,
+    extra: {}
+  }, contextHighlights, recommendations);
+
+  const sleepSummary = buildSectionNarrative('sleep', {
+    weeklyValue: weekly.sleep,
+    goalValue: goals.sleepMinutes || null,
+    fulfilPct: fulfil.sleepPct,
+    band: bands.sleep,
+    trendValue: trend.sleep,
+    extra: {
+      sleepConsistencyScore: sleepConsistency.score
+    }
+  }, contextHighlights, recommendations);
+
+  const readinessSummary = buildSectionNarrative('readiness', {
+    weeklyValue: weekly.rhr,
+    goalValue: goals.restingHeartRate || null,
+    fulfilPct: fulfil.rhrPct,
+    band: bands.readiness,
+    trendValue: trend.rhr,
+    extra: {}
+  }, contextHighlights, recommendations);
+
+  const coachCall = buildCoachCall(bands, contextHighlights, decision);
+
+  return {
+    activityBullets: [activitySummary.text, strengthSummary.text, fitnessSummary.text],
+    recoveryBullets: [sleepSummary.text],
+    readinessBullets: [readinessSummary.text],
+    contextHighlights,
+    coachCall
+  };
+}
+
+function formatList(items){
+  if (!items || !items.length) return '';
+  if (items.length === 1) return items[0];
+  if (items.length === 2) return `${items[0]} and ${items[1]}`;
+  return `${items.slice(0, -1).join(', ')}, and ${items[items.length - 1]}`;
+}
+
+function buildCoachCall(bands, contexts, decision){
+  if (!bands) return '';
+  const met = [];
+  const watch = [];
+  const strain = [];
+  Object.keys(SECTION_LABEL_SHORT).forEach(key => {
+    const label = SECTION_LABEL_SHORT[key];
+    const band = bands[key];
+    if (!band || band === 'unknown') return;
+    if (band === 'green') {
+      met.push(label);
+    } else if (band.startsWith('yellow')) {
+      watch.push(label);
+    } else if (band.startsWith('red')) {
+      strain.push(label);
+    }
+  });
+
+  const parts = [];
+  if (met.length) parts.push(`Goals met: ${formatList(met)}.`);
+  if (watch.length) parts.push(`Watch: ${formatList(watch)}.`);
+  if (strain.length) parts.push(`Needs action: ${formatList(strain)}.`);
+
+  if (contexts && contexts.length) {
+    const highlight = contexts[0];
+    parts.push(`${highlight.section}: ${highlight.message}.`);
+  }
+
+  if (decision && decision.plan) {
+    let planLine = '';
+    switch (decision.plan) {
+      case 'Push':
+        planLine = 'Plan: Push with a measured progression while monitoring recovery.';
+        break;
+      case 'Deload':
+        planLine = 'Plan: Deload and bank recovery time.';
+        break;
+      case 'Sustain':
+      default:
+        planLine = 'Plan: Hold steady and reinforce routines.';
+        break;
+    }
+    parts.push(planLine);
+  }
+
+  return parts.join(' ');
+}
+
+function buildCapacitySentence(capacity, decision, ds, weekly, goals){
+  if (!capacity || !decision || !ds) return '';
+  const recoveryBits = [];
+  if (ds.sleep && ds.sleep.deltaGoalStr && ds.sleep.deltaGoalStr !== '—' && ds.sleep.deltaGoalStr !== '+0h 0m') {
+    recoveryBits.push(`Sleep ${ds.sleep.deltaGoalStr}`);
+  }
+  const rhrDelta = ds.rhr && ds.rhr.deltaTrendStr;
+  if (rhrDelta && rhrDelta !== '+0 bpm' && rhrDelta !== '0 bpm') {
+    recoveryBits.push(`RHR ${rhrDelta}`);
+  }
+  const recoveryClause = recoveryBits.length ? recoveryBits.join(' & ') : 'Recovery steady';
+
+  const strainBits = [];
+  if (ds.load && ds.load.pctTrendStr && ds.load.pctTrendStr !== '0%' && ds.load.pctTrendStr !== '+0%') {
+    let clause = `Load ${ds.load.pctTrendStr}`;
+    const acwr = ds.load.acwr;
+    if (acwr && acwr.value != null && acwr.label !== 'Data Gaps' && (acwr.value >= CONFIG.ACWR.alertHigh || acwr.value <= CONFIG.ACWR.alertLow)) {
+      clause += ` (ACWR ${fmtAcwr(acwr.value)})`;
+    }
+    strainBits.push(clause);
+  }
+  const strainClause = strainBits.length ? strainBits.join(' & ') : 'Strain stable';
+
+  const bandwidthBits = [];
+  const workGoal = goals.weeklyWorkHours || 0;
+  const workHours = weekly.workHours || 0;
+  if (workGoal && workHours < 0.85 * workGoal) {
+    bandwidthBits.push('Work below target');
+  } else if (workGoal && workHours >= 0.95 * workGoal) {
+    bandwidthBits.push('Work near plateau');
+  }
+  if (ds.steps && ds.steps.days6k < Math.max(CONFIG.Steps.purpleMinDays, (goals.stepsFloorDays || CONFIG.Steps.fallbackFloorDays))) {
+    bandwidthBits.push('Movement inconsistent');
+  }
+  const sleepConsistency = ds.sleep?.consistency;
+  if (sleepConsistency && sleepConsistency.score != null && sleepConsistency.score < CONFIG.Sleep.consistencyAmber) {
+    const label = (sleepConsistency.label || 'Irregular').toLowerCase();
+    bandwidthBits.push(`Sleep ${label} (SRI ${sleepConsistency.score}/100)`);
+  }
+  const bandwidthClause = bandwidthBits.length ? bandwidthBits.join(' & ') : 'Bandwidth steady';
+
+  const clauses = [recoveryClause, strainClause, bandwidthClause];
+  while (clauses.length > 0) {
+    const sentence = `Capacity: ${capacity.label} — ${clauses.join('; ')}. ${decision.plan}: ${decision.lever}`;
+    if (sentence.length <= 180) return sentence;
+    clauses.pop();
+  }
+  return `Capacity: ${capacity.label} — ${recoveryClause}. ${decision.plan}: ${decision.lever}`;
+}
+
+function formatMinutesToHours(totalMinutes) { return fmtHMin(totalMinutes); } // alias to Data.gs helper
+
+// --- Email (delta-first, capacity/decision top, stats appendix end) ---
+function distributeReport(report, scores, weekly, trend, goals, warnings = [], dsStats = null, capacity = null, decision = null, gapsNote = '', degradeBanner = '', weekMeta = null, composites = null, emailLogMeta = null, renderContext = {}) {
+  // Convenience aliases for function parameters
+  const gapsNoteMsg = gapsNote;
+  const degradeBannerMsg = degradeBanner;
+  const ds = dsStats || {};
+  
+  // Destructure renderContext for precomputed render variables
+  const {
+    driverCards = [],
+    componentRows = [],
+    readinessPctValue = null,
+    outputPctValue = null,
+    readinessTrendDisplay = '—',
+    readinessSubtitle = 'Readiness data missing — log recovery inputs.',
+    outputTrendDisplay = '—',
+    outputSubtitle = 'Output data missing — keep execution logs.',
+    planNarrativeLine = 'Maintain current workload and protect bedtime/wake windows.',
+    planIcon = '↔',
+    coachCallText = '',
+    coachNotes = [],
+    leverDisplay = '',
+    coachNotesList = [],
+    coachBullets = [],
+    coachReadSafe = null,
+    gatingSummary = '',
+    gatingSleep = false,
+    degradeReason = '',
+    planDisplay = 'HOLD',
+    gatingAcwr = false,
+    insufficientGlobal = false,
+    latestRollup = null,
+    driverMissingNotes = [],
+    sleepConsistencyLabel = 'Data Gaps',
+    sleepConsistencySd = null,
+    acwrValue = null,
+    strengthAcwr = {},
+    rhrDeltaText = '—',
+    sleepConsistency = {}
+  } = renderContext;
+  
+  const headingLabel = weekMeta?.label || `Week of ${formatDateIso_(new Date())}`;
+  const totalScore = report?.metadata?.totalBucketScore != null ? report.metadata.totalBucketScore : null;
+  const totalScoreDisplay = totalScore != null ? `${totalScore}` : (scores.overall != null ? `${Math.round(scores.overall)}` : '—');
+  const totalGrade = report?.metadata?.totalGrade || (totalScore != null ? gradeFromScore_(totalScore).grade : '—');
+  const totalBandKey = report?.metadata?.totalBand || (totalScore != null ? gradeFromScore_(totalScore).band : 'neutral');
+  const totalBandClass = bandToStatusClass_(totalBandKey);
+  const totalBandLabel = bandToLabel_(totalBandKey);
+  const heading = `${headingLabel} — (${totalScoreDisplay}/100) Health Score`;
+
+  const fulfil = ds?.fulfilment || {};
+  const sections = report.sections || {};
+  const activitySection = sections.activity || {};
+  const recoverySection = sections.recovery || {};
+  const readinessSection = sections.readiness || {};
+
+  // These variables now come from renderContext, so compute only derived values
+  const sleepConsistencyScore = (typeof sleepConsistency.score === 'number') ? Math.max(0, Math.min(100, Math.round(sleepConsistency.score))) : null;
+  const sleepConsistencyGaps = sleepConsistency.gaps != null ? sleepConsistency.gaps : null;
+  const sleepStatusClass = getStatusClass_(sleepConsistencyLabel);
+  const sleepConsistencyTextParts = [];
+  if (sleepConsistencyLabel) sleepConsistencyTextParts.push(sleepConsistencyLabel);
+  if (sleepConsistencySd != null) sleepConsistencyTextParts.push(`SD ${fmtDurationMinutes_(sleepConsistencySd)}`);
+  if (sleepConsistencyGaps != null) sleepConsistencyTextParts.push(`${sleepConsistencyGaps} gaps`);
+  const sleepConsistencyLine = sleepConsistencyTextParts.join(' · ') || 'Data Gaps';
+
+  const acwrDisplay = acwrValue != null ? `${acwrValue.toFixed(2)}${strengthAcwr.label ? ` (${strengthAcwr.label})` : ''}` : (strengthAcwr.label || 'Data Gaps');
+  const acwrLoadPct = parseSignedNumber_(ds?.load?.pctTrendStr);
+
+  const rhrDeltaValue = parseSignedNumber_(rhrDeltaText);
+  const loadTrendValue = trend.trainingLoad;
+  const loadGoalValue = goals.weeklyTrainingLoad || null;
+  const stepsTrendValue = trend.steps;
+
+  const floorTarget = Math.max(CONFIG.Steps.purpleMinDays, goals.stepsFloorDays || CONFIG.Steps.fallbackFloorDays);
+  const bucketScoresMeta = report?.metadata?.bucketScores || {};
+  const sleepBucketScore = bucketScoresMeta.sleep || scoreSleepBucket_({
+    sleepThisWeek: weekly.sleep,
+    sleepGoal: goals.sleepMinutes || null,
+    sdMinutes: sleepConsistencySd,
+    rhrDelta: rhrDeltaValue
+  });
+  const loadBucketScore = bucketScoresMeta.load || scoreLoadBucket_({
+    acwr: acwrValue,
+    loadPctVsTrend: acwrLoadPct
+  });
+  const activityBucketScore = bucketScoresMeta.activity || scoreActivityBucket_({
+    stepsThisWeek: weekly.steps,
+    stepsGoal: goals.steps || null,
+    floorDays: ds?.steps?.days6k ?? null,
+    floorTarget
+  });
+  const workBucketScore = bucketScoresMeta.work || scoreWorkBucket_({
+    hoursThisWeek: weekly.workHours,
+    hoursGoal: goals.weeklyWorkHours || null,
+    deepWorkPct: ds?.work?.deepWorkPct ?? null
+  });
+  if (!sleepBucketScore.grade) {
+    const info = gradeFromScore_(sleepBucketScore.score);
+    sleepBucketScore.grade = info.grade;
+    sleepBucketScore.band = info.band;
+    sleepBucketScore.bandClass = bandToStatusClass_(info.band);
+    sleepBucketScore.bandLabel = bandToLabel_(info.band);
+    sleepBucketScore.scoreText = sleepBucketScore.score != null ? `${sleepBucketScore.score}/100` : '';
+  }
+  if (!loadBucketScore.grade) {
+    const info = gradeFromScore_(loadBucketScore.score);
+    loadBucketScore.grade = info.grade;
+    loadBucketScore.band = info.band;
+    loadBucketScore.bandClass = bandToStatusClass_(info.band);
+    loadBucketScore.bandLabel = bandToLabel_(info.band);
+    loadBucketScore.scoreText = loadBucketScore.score != null ? `${loadBucketScore.score}/100` : '';
+  }
+  if (!activityBucketScore.grade) {
+    const info = gradeFromScore_(activityBucketScore.score);
+    activityBucketScore.grade = info.grade;
+    activityBucketScore.band = info.band;
+    activityBucketScore.bandClass = bandToStatusClass_(info.band);
+    activityBucketScore.bandLabel = bandToLabel_(info.band);
+    activityBucketScore.scoreText = activityBucketScore.score != null ? `${activityBucketScore.score}/100` : '';
+  }
+  if (!workBucketScore.grade) {
+    const info = gradeFromScore_(workBucketScore.score);
+    workBucketScore.grade = info.grade;
+    workBucketScore.band = info.band;
+    workBucketScore.bandClass = bandToStatusClass_(info.band);
+    workBucketScore.bandLabel = bandToLabel_(info.band);
+    workBucketScore.scoreText = workBucketScore.score != null ? `${workBucketScore.score}/100` : '';
+  }
+  const totalBucketScore = report?.metadata?.totalBucketScore != null
+    ? report.metadata.totalBucketScore
+    : computeTotalScore_({ sleep: sleepBucketScore, load: loadBucketScore, activity: activityBucketScore, work: workBucketScore });
+
+  const sleepAcuteDiff = (weekly.sleep != null && trend.sleep != null) ? weekly.sleep - trend.sleep : null;
+  const activityAcuteDiff = parseSignedNumber_(ds?.steps?.pctTrendStr);
+  const workAcuteDiff = parseSignedNumber_(ds?.work?.pctTrendStr);
+  const loadAcuteDiff = acwrLoadPct != null && isFinite(acwrLoadPct) ? acwrLoadPct : null;
+
+  const bucketScoreMap = {
+    sleep: sleepBucketScore,
+    load: loadBucketScore,
+    activity: activityBucketScore,
+    work: workBucketScore
+  };
+
+  const acuteMap = {
+    sleep: sleepAcuteDiff,
+    load: loadAcuteDiff,
+    activity: activityAcuteDiff,
+    work: workAcuteDiff
+  };
+
+  const sanitizeCard = card => ({
+    key: card.key,
+    className: card.className,
+    title: escapeHtml_(card.title),
+    metrics: (card.metrics || []).map(m => ({ label: escapeHtml_(m.label), value: escapeHtml_(m.value) })),
+    insight: sanitizeTextForHtml_(card.insight || '', 140),
+    grade: escapeHtml_(card.grade || '—'),
+    score: card.score ? escapeHtml_(card.score) : '',
+    bandClass: card.bandClass || '',
+    bandLabel: card.bandLabel ? escapeHtml_(card.bandLabel) : '',
+    severity: sanitizeTextForHtml_(card.severity || '', 140)
+  });
+  const cleanedCards = driverCards.map(sanitizeCard).filter(card => card.metrics.length || card.insight);
+
+  const cleanedRows = componentRows.map(row => {
+    const metric = escapeHtml_(row.metric);
+    const currentText = escapeHtml_(row.current || '—');
+    let current = currentText;
+    if (row.badge) {
+      const badgeClass = `badge ${row.badge.className || 'status-neutral'}`;
+      const badgeLabel = escapeHtml_(row.badge.label || 'Status');
+      current = `${currentText} <span class="${badgeClass}">${badgeLabel}</span>`;
+    }
+    return {
+      metric,
+      current,
+      average: escapeHtml_(row.average || '—'),
+      acute: escapeHtml_(row.acute || '—'),
+      target: escapeHtml_(row.target || '—'),
+      fourWeekGoal: escapeHtml_(row.fourWeekGoal || '—')
+    };
+  });
+
+  const appendixLines = [
+    `Sleep minutes: ${weekly.sleep != null ? fmtHMin(weekly.sleep) : '—'} (4-wk ${trend.sleep != null ? fmtHMin(trend.sleep) : '—'})`,
+    `Sleep SD: ${sleepConsistencySd != null ? fmtDurationMinutes_(sleepConsistencySd) : '—'} (${sleepConsistencyLabel})`,
+    `Resting HR: ${weekly.rhr != null ? fmtBpm(weekly.rhr) : '—'} (4-wk ${trend.rhr != null ? fmtBpm(trend.rhr) : '—'})`,
+    `ACWR: ${acwrValue != null ? acwrValue.toFixed(2) : '—'} (${strengthAcwr.label || 'Data Gaps'})`,
+    `Steps: ${weekly.steps != null ? fmtInt(weekly.steps) : '—'} (4-wk ${trend.steps != null ? fmtInt(trend.steps) : '—'})`,
+    `Work hours: ${weekly.workHours != null ? Math.round(weekly.workHours) : '—'}h (4-wk ${trend.workHours != null ? Math.round(trend.workHours) : '—'}h)`,
+    `Data completeness — Activity: ${ds?.missing?.activity || 0} missing; Sleep: ${ds?.missing?.sleep || 0}; RHR: ${ds?.missing?.rhr || 0}`,
+    `Sleep consistency source: ${sleepConsistency.source || 'unknown'}`
+  ];
+  if (driverMissingNotes.length) appendixLines.push(...driverMissingNotes);
+  if (degradeReason && !/coach_call_missing/i.test(degradeReason)) appendixLines.push(`AI fallback: ${degradeReason}`);
+  if (gatingAcwr && planDisplay === 'RECOVER') appendixLines.push('Plan adjusted due to ACWR gating (>1.5).');
+  const appendixPre = escapeHtml_(appendixLines.map(line => `• ${line}`).join('\n'));
+
+  const gapsHtml = gapsNoteMsg ? `<div class="banner banner-neutral">${escapeHtml_(gapsNoteMsg)}</div>` : '';
+  const degradeHtml = degradeBannerMsg ? `<div class="banner banner-warning">${escapeHtml_(degradeBannerMsg)}</div>` : '';
+
+  const css = `
+        :root {
+          --color-primary: #2C6BED;
+          --color-gray-900: #111827;
+          --color-gray-700: #374151;
+          --color-gray-600: #4B5563;
+          --color-gray-500: #6B7280;
+          --color-gray-300: #D1D5DB;
+          --color-gray-200: #E5E7EB;
+          --color-gray-50: #F9FAFB;
+          --color-success: #10B981;
+          --color-warning: #F59E0B;
+          --color-danger: #EF4444;
+          --color-purple: #8B5CF6;
+          --space-1: 4px;
+          --space-2: 8px;
+          --space-3: 16px;
+          --space-4: 24px;
+          --space-5: 32px;
+          --radius-card: 12px;
+        }
+        body { font-family: 'Inter', sans-serif; color: var(--color-gray-900); line-height: 1.6; font-size: 14px; background: var(--color-gray-50); }
+        .container { max-width: 900px; margin: auto; padding: var(--space-5); background: #fff; border-radius: 20px; box-shadow: 0 12px 32px rgba(17,24,39,0.08); }
+        h1 { font-size: 28px; margin: 0 0 var(--space-3); color: var(--color-gray-900); }
+        h2 { font-size: 18px; margin: 0 0 var(--space-2); color: var(--color-gray-900); }
+        p { margin: 0; }
+        .t1 { border-bottom: 1px solid var(--color-gray-200); padding-bottom: var(--space-4); margin-bottom: var(--space-4); }
+        .t1-row { display: flex; flex-wrap: wrap; gap: var(--space-4); align-items: flex-start; }
+        .t1-main { flex: 1 1 280px; }
+        .t1-week { font-size: 12px; color: var(--color-gray-500); text-transform: uppercase; letter-spacing: 0.08em; margin-bottom: var(--space-1); }
+        .t1-score { display: flex; align-items: baseline; gap: var(--space-2); font-weight: 700; margin-bottom: var(--space-1); }
+        .t1-score-grade { font-size: 48px; font-weight: 700; line-height: 1; }
+        .t1-score-meta { font-size: 12px; color: var(--color-gray-600); text-transform: uppercase; letter-spacing: 0.08em; }
+        .t1-plan { font-size: 14px; font-weight: 600; color: var(--color-gray-700); text-transform: uppercase; letter-spacing: 0.06em; margin-bottom: var(--space-2); }
+        .plan-copy { font-size: 13px; color: var(--color-gray-700); margin-bottom: var(--space-3); line-height: 1.4; }
+        .t1-tiles { flex: 1 1 220px; display: grid; gap: var(--space-3); }
+        .tile { background: var(--color-gray-50); border: 1px solid var(--color-gray-200); border-radius: var(--radius-card); padding: var(--space-3); box-shadow: inset 0 1px 0 rgba(255,255,255,0.6); }
+        .tile-label { font-size: 12px; color: var(--color-gray-500); text-transform: uppercase; letter-spacing: 0.08em; display: flex; align-items: center; gap: var(--space-1); }
+        .tile-value { font-size: 34px; font-weight: 700; color: var(--color-gray-900); line-height: 1; }
+        .tile-trend { font-size: 12px; color: var(--color-gray-600); margin-top: var(--space-1); }
+        .tile-subtitle { font-size: 13px; color: var(--color-gray-700); margin-top: var(--space-1); line-height: 1.4; }
+        .badge { display: inline-block; padding: 2px 8px; border-radius: 999px; font-size: 12px; font-weight: 600; }
+        .badge.status-success { background: rgba(16,185,129,0.16); color: var(--color-success); }
+        .badge.status-warning { background: rgba(245,158,11,0.16); color: var(--color-warning); }
+        .badge.status-danger { background: rgba(239,68,68,0.16); color: var(--color-danger); }
+        .badge.status-purple { background: rgba(139,92,246,0.16); color: var(--color-purple); }
+        .badge.status-neutral { background: rgba(55,65,81,0.12); color: var(--color-gray-700); }
+        .card-score { display: flex; align-items: baseline; gap: var(--space-2); margin-bottom: var(--space-1); }
+        .card-grade { font-size: 32px; font-weight: 700; color: var(--color-gray-900); line-height: 1; }
+        .card-score-meta { font-size: 12px; color: var(--color-gray-600); text-transform: uppercase; letter-spacing: 0.08em; }
+        .card-severity { font-size: 12px; color: var(--color-gray-600); margin-bottom: var(--space-2); letter-spacing: 0.04em; text-transform: uppercase; }
+        .banner { padding: var(--space-2); border-radius: var(--radius-card); margin-bottom: var(--space-3); font-size: 13px; }
+        .banner-warning { background: rgba(245,158,11,0.1); border: 1px solid rgba(245,158,11,0.3); color: var(--color-warning); }
+        .banner-neutral { background: rgba(44,107,237,0.08); border: 1px solid rgba(44,107,237,0.2); color: var(--color-primary); }
+        .t2 { margin-bottom: var(--space-4); display: grid; gap: var(--space-3); grid-template-columns: repeat(auto-fit, minmax(200px,1fr)); }
+        .card { border: 1px solid var(--color-gray-200); border-top: 4px solid var(--color-gray-200); border-radius: var(--radius-card); padding: var(--space-3); background: #fff; box-shadow: 0 6px 18px rgba(17,24,39,0.05); }
+        .card h2 { font-size: 16px; margin-bottom: var(--space-2); }
+        .card ul { list-style: none; margin: 0; padding: 0; display: grid; gap: var(--space-1); }
+        .card ul li { display: flex; justify-content: space-between; font-size: 13px; color: var(--color-gray-700); }
+        .card ul li span:last-child { font-weight: 600; color: var(--color-gray-900); }
+        .card-insight { margin-top: var(--space-2); font-size: 13px; color: var(--color-gray-700); }
+        .card--recovery { border-top-color: var(--color-purple); }
+        .card--workload { border-top-color: var(--color-danger); }
+        .card--activity { border-top-color: var(--color-success); }
+        .card--cognition { border-top-color: var(--color-warning); }
+        .insights { margin-bottom: var(--space-4); }
+        .insights ul { list-style: disc inside; margin: 0; padding: 0; color: var(--color-gray-700); }
+        .t-method { border: 1px solid var(--color-gray-200); border-radius: var(--radius-card); padding: var(--space-3); margin-bottom: var(--space-4); background: rgba(17,24,39,0.02); }
+        .t-method h2 { font-size: 16px; margin-bottom: var(--space-2); color: var(--color-gray-900); }
+        .method-list { margin: 0; padding-left: var(--space-3); display: grid; gap: var(--space-2); color: var(--color-gray-700); }
+        .method-list li { font-size: 13px; line-height: 1.5; }
+        .method-list strong { color: var(--color-gray-900); }
+        .t3-table { width: 100%; border-collapse: collapse; margin-bottom: var(--space-4); }
+        .t3-table th, .t3-table td { padding: var(--space-2); text-align: left; font-size: 13px; }
+        .t3-table th { background: var(--color-gray-50); color: var(--color-gray-700); text-transform: uppercase; letter-spacing: 0.04em; }
+        .t3-table tr:nth-child(even) { background: rgba(17,24,39,0.02); }
+        .t3-table td { color: var(--color-gray-900); }
+        .t4 { border-top: 1px solid var(--color-gray-200); padding-top: var(--space-4); margin-bottom: var(--space-4); }
+        .coach-plan { display: flex; align-items: center; gap: var(--space-2); margin-bottom: var(--space-2); }
+        .coach-plan-icon { font-size: 26px; line-height: 1; }
+        .coach-plan h2 { font-size: 18px; margin: 0; }
+        .coach-note { font-size: 13px; color: var(--color-gray-700); margin-bottom: var(--space-2); }
+        .coach-bullets { list-style: none; padding: 0; margin: 0; display: grid; gap: var(--space-2); }
+        .coach-bullets li { display: flex; gap: var(--space-2); align-items: baseline; font-size: 13px; }
+        .coach-tag { display: inline-block; min-width: 70px; font-size: 11px; text-transform: uppercase; color: var(--color-gray-500); letter-spacing: 0.05em; }
+        .coach-read { border: 1px solid var(--color-gray-200); border-radius: var(--radius-card); padding: var(--space-4); margin-bottom: var(--space-4); background: var(--color-gray-50); }
+        .coach-read h2 { font-size: 18px; margin: 0 0 var(--space-2); color: var(--color-gray-800); }
+        .coach-read-block { margin-bottom: var(--space-3); }
+        .coach-read-block h3 { font-size: 12px; text-transform: uppercase; letter-spacing: 0.08em; color: var(--color-gray-500); margin: 0 0 var(--space-1); }
+        .coach-read-block p { margin: 0 0 var(--space-1); font-size: 13px; color: var(--color-gray-800); }
+        .coach-read-block ul { margin: 0; padding-left: var(--space-3); }
+        .coach-read-block li { font-size: 13px; color: var(--color-gray-800); margin: 0 0 var(--space-1); }
+        .t5 { background: rgba(17,24,39,0.02); border: 1px solid var(--color-gray-200); border-radius: var(--radius-card); padding: var(--space-3); }
+        .t5 h2 { font-size: 16px; margin-bottom: var(--space-2); }
+        .t5 pre { background: rgba(17,24,39,0.04); border-radius: var(--radius-card); padding: var(--space-2); font-family: 'Roboto Mono', monospace; font-size: 12px; white-space: pre-wrap; color: var(--color-gray-700); }
+        @media print { body { background: #fff; } .container { box-shadow: none; } }
+      `;
+
+  const tierOneHtml = `
+    <header class="t1">
+      <div class="t1-row">
+        <div class="t1-main">
+          <div class="t1-week">${escapeHtml_(headingLabel)}</div>
+          <div class="t1-score">
+            <span class="t1-score-grade">${escapeHtml_(totalGrade)}</span>
+            ${totalScoreDisplay !== '—' ? `<span class="t1-score-meta">${escapeHtml_(totalScoreDisplay)}/100</span>` : ''}
+            ${totalBandLabel ? `<span class="badge ${totalBandClass}">${escapeHtml_(totalBandLabel)}</span>` : ''}
+          </div>
+          <div class="t1-plan">Plan: ${escapeHtml_(planDisplay)}</div>
+          <div class="plan-copy">${escapeHtml_(planNarrativeLine)}</div>
+        </div>
+        <div class="t1-tiles">
+          <div class="tile">
+            <span class="tile-label">Readiness</span>
+            <span class="tile-value">${readinessPctValue != null ? `${readinessPctValue}%` : '—'}</span>
+            <span class="tile-trend">${escapeHtml_(readinessTrendDisplay)}</span>
+            <span class="tile-subtitle">${escapeHtml_(readinessSubtitle)}</span>
+          </div>
+          <div class="tile">
+            <span class="tile-label">Output</span>
+            <span class="tile-value">${outputPctValue != null ? `${outputPctValue}%` : '—'}</span>
+            <span class="tile-trend">${escapeHtml_(outputTrendDisplay)}</span>
+            <span class="tile-subtitle">${escapeHtml_(outputSubtitle)}</span>
+          </div>
+        </div>
+      </div>
+    </header>`;
+
+  const tierTwoHtml = cleanedCards.length ? `
+    <section class="t2">
+      ${cleanedCards.map(card => `
+        <article class="${card.className}">
+          <h2>${card.title}</h2>
+          ${card.grade ? `<div class="card-score"><span class="card-grade">${card.grade}</span>${card.score ? `<span class="card-score-meta">${card.score}</span>` : ''}${card.bandLabel ? ` <span class="badge ${card.bandClass}">${card.bandLabel}</span>` : ''}</div>` : ''}
+          ${card.severity ? `<p class="card-severity">${card.severity}</p>` : ''}
+          <ul>
+            ${card.metrics.map(m => `<li><span>${m.label}</span><span>${m.value}</span></li>`).join('')}
+          </ul>
+          ${card.insight ? `<p class="card-insight">${card.insight}</p>` : ''}
+        </article>
+      `).join('')}
+    </section>` : '';
+
+  const coachReadHtml = coachReadSafe ? renderCoachReadSection_(coachReadSafe) : '';
+
+  const tierThreeHtml = `
+    <section class="t3">
+      <table class="t3-table">
+        <thead><tr><th>Metric</th><th>This Week</th><th>4-wk Avg</th><th>This Week vs 4-wk</th><th>Goal</th><th>4-wk vs Goal</th></tr></thead>
+        <tbody>
+          ${cleanedRows.map(row => `<tr><td>${row.metric}</td><td>${row.current}</td><td>${row.average}</td><td>${row.acute}</td><td>${row.target}</td><td>${row.fourWeekGoal}</td></tr>`).join('')}
+        </tbody>
+      </table>
+    </section>`;
+
+  const defaultCoachLine = planNarrativeLine || gatingSummary || 'No additional coach notes this week.';
+  const coachNote = coachCallText || escapeHtml_(defaultCoachLine);
+  const tierFourHtml = `
+    <section class="t4 coach">
+      <div class="coach-plan">
+        <span class="coach-plan-icon">${planIcon}</span>
+        <div>
+          <h2>Plan: ${planDisplay}</h2>
+          <p class="coach-note">${coachNote}</p>
+        </div>
+      </div>
+      <div class="coach-note">${leverDisplay}</div>
+      ${coachBullets.length ? `<ul class="coach-bullets">${coachBullets.map(item => `<li><span class="coach-tag">${item.tag}</span><span>${item.text}</span></li>`).join('')}</ul>` : ''}
+      ${coachNotesList.length ? `<p class="coach-note">${coachNotesList.join(' ')}</p>` : ''}
+    </section>`;
+
+  const methodologyHtml = `
+    <section class="t-method">
+      <h2>How we calculate this</h2>
+      <ul class="method-list">
+        <li><strong>Readiness</strong> A recency-weighted 4-week composite of recovery inputs: Sleep vs goal (40%), Resting HR trend (30%, lower is better), Sleep variability SD (20%, lower is better), ACWR balance (10%, closer to 1.0 is better). Weekly input scores are blended with weights 40/30/20/10 (most recent week carries more weight). Scaled to 0–100%.</li>
+        <li><strong>Output</strong> A recency-weighted 4-week composite of execution outputs: Gym load vs goal (40%), Steps vs goal (30%), Work hours vs goal (30%). Weekly output scores are blended with weights 50/25/15/10 (this week counts most). Scaled to 0–100%.</li>
+        <li><strong>Plan</strong> Balance = Readiness − Output → Push (≥ +8), Hold (−7 to +7), Recover (≤ −8). (Arrows show week-over-week change; all values capped to 0–100% for readability.)</li>
+      </ul>
+    </section>`;
+
+  const tierFiveHtml = `
+    <section class="t5 appendix">
+      <h2>Appendix — Raw Metrics</h2>
+      <pre>${appendixPre}</pre>
+    </section>`;
+
+  const insightsHtml = '';
+
+  const finalHtml = `
+    <html>
+      <head>
+        <link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;600;700&family=Roboto+Mono:wght@400;500&display=swap" rel="stylesheet">
+        <style>${css}</style>
+      </head>
+      <body>
+        <div class="container">
+          ${gapsHtml}
+          ${degradeHtml}
+          ${tierOneHtml}
+          ${tierTwoHtml}
+          ${coachReadHtml}
+          ${tierFourHtml}
+          ${methodologyHtml}
+          ${tierFiveHtml}
+          ${insightsHtml}
+          ${tierThreeHtml}
+        </div>
+      </body>
+    </html>
+  `;
+
+  const blob = Utilities.newBlob(finalHtml, 'text/html', 'Weekly_Report.html');
+  const pdf = blob.getAs('application/pdf');
+  const recipient = 'conor.bliss.henaghan@gmail.com';
+  const emailPlanText = planNarrativeLine && planNarrativeLine.trim()
+    ? planNarrativeLine.trim()
+    : 'Your weekly performance report is attached.';
+  const emailHtmlBody = `<p>${sanitizeTextForHtml_(emailPlanText, 600)}</p>`;
+  const emailOptions = {
+    attachments: [pdf.setName(`${heading}.pdf`)],
+    htmlBody: emailHtmlBody
+  };
+  const attachmentCount = emailOptions.attachments ? emailOptions.attachments.length : 0;
+  logWeeklyJob_('email:render_ready', {
+    heading,
+    attachments: attachmentCount,
+    degradeBanner: Boolean(degradeBanner)
+  });
+  const emailLogPayload = {
+    to: recipient,
+    subject: heading,
+    method: 'GmailApp',
+    status: '',
+    error: '',
+    htmlUrl: emailLogMeta?.htmlUrl || '',
+    pdfUrl: emailLogMeta?.pdfUrl || '',
+    jsonUrl: emailLogMeta?.jsonUrl || '',
+    aiParseOk: emailLogMeta?.aiParseOk,
+    usedFallback: emailLogMeta?.usedFallback,
+    schemaDiag: emailLogMeta?.schemaDiag || '',
+    aiParseError: emailLogMeta?.aiParseError || ''
+  };
+  try {
+    logWeeklyJob_('email:send_attempt', { heading, to: recipient });
+    GmailApp.sendEmail(recipient, heading, emailPlanText, emailOptions);
+    logWeeklyJob_('email:send_success', { heading });
+    logEmailLogEntry_({
+      ...emailLogPayload,
+      status: 'sent'
+    });
+  } catch (error) {
+    logWeeklyJob_('email:send_error', { heading, message: error?.message || 'unknown' });
+    logEmailLogEntry_({
+      ...emailLogPayload,
+      status: 'failed',
+      error: error?.message || 'unknown'
+    });
+    throw error;
+  }
+}
+
+
+
+
+
+// --- Logging (top-level) ---
+function setupWeeklyTrigger() {
+  ScriptApp.getProjectTriggers()
+    .filter(trigger => trigger.getHandlerFunction() === 'weeklyReportJob')
+    .forEach(trigger => ScriptApp.deleteTrigger(trigger));
+
+  ScriptApp.newTrigger('weeklyReportJob')
+    .timeBased()
+    .onWeekDay(ScriptApp.WeekDay.SUNDAY)
+    .atHour(15)
+    .create();
+}
+
+function logReportToSheet(reportContent, weekly = null, trend = null, scores = null, weekMeta = null) {
+  const ss = SpreadsheetApp.getActive();
+  let sh = ss.getSheetByName('Reports');
+  if (!sh) {
+    sh = ss.insertSheet('Reports');
+    sh.appendRow([
+      'Timestamp', 'Week #', 'Overall', 'PerformanceIndex', 'Recovery', 'Readiness',
+      'WorkHours', 'TrainingLoadKg', 'PRs', 'StepsAvg', 'SleepMin', 'RHR',
+      'Trend_WorkHours', 'Trend_TrainingLoadKg', 'Trend_StepsAvg', 'Trend_SleepMin', 'Trend_RHR',
+      'AI_Raw'
+    ]);
+  }
+  const weekIdentifier = weekMeta?.isoWeek || computeIsoWeekNumber_(new Date());
+  const ts = new Date();
+  const w = weekly || {}, t = trend || {}, s = scores || {};
+  sh.appendRow([
+    ts, weekIdentifier,
+    (s.overall ?? ''), (s.activity ?? ''), (s.recovery ?? ''), (s.readiness ?? ''),
+    (w.workHours ?? ''), (w.trainingLoad ?? ''), (w.prs ?? ''), (w.steps ?? ''), (w.sleep ?? ''), (w.rhr ?? ''),
+    (t.workHours ?? ''), (t.trainingLoad ?? ''), (t.steps ?? ''), (t.sleep ?? ''), (t.rhr ?? ''),
+    String(reportContent || '')
+  ]);
+}
+
+function logEmailLogEntry_(entry = {}) {
+  const ss = SpreadsheetApp.getActive();
+  let sh = ss.getSheetByName('EmailLog');
+  if (!sh) {
+    sh = ss.insertSheet('EmailLog');
+    sh.appendRow([
+      'Timestamp', 'To', 'Subject', 'Method', 'Status', 'Error',
+      'HtmlUrl', 'PdfUrl', 'JsonUrl', 'AiParseOk', 'UsedFallback', 'SchemaDiag', 'AiParseError'
+    ]);
+  }
+  const boolOrBlank = value => {
+    if (value === null || value === undefined || value === '') return '';
+    return Boolean(value);
+  };
+  sh.appendRow([
+    new Date(),
+    entry.to || '',
+    entry.subject || '',
+    entry.method || 'GmailApp',
+    entry.status || '',
+    entry.error || '',
+    entry.htmlUrl || '',
+    entry.pdfUrl || '',
+    entry.jsonUrl || '',
+    boolOrBlank(entry.aiParseOk),
+    boolOrBlank(entry.usedFallback),
+    entry.schemaDiag || '',
+    entry.aiParseError || ''
+  ]);
+}

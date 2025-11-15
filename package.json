@@ -1,0 +1,11 @@
+{
+  "name": "health-coach-ui",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "test": "node --test"
+  },
+  "devDependencies": {
+    "c8": "^10.1.3"
+  }
+}

@@ -1,0 +1,36 @@
+# Secrets & credentials - CRITICAL
+client_secret.json
+service_account.json
+token.json
+.env
+credentials.json
+
+# Python environment
+.venv/
+venv/
+__pycache__/
+*.pyc
+.pytest_cache/
+.ruff_cache/
+
+# Node/build artifacts
+gas/node_modules/
+gas/dist/
+gas/build/
+node_modules/
+
+# Logs & generated files
+logs/
+exports/
+*.log
+
+# IDE & editor
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+.DS_Store
+
+# OS
+Thumbs.db
