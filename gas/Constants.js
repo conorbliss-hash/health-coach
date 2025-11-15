@@ -25,7 +25,7 @@ const FALLBACK_RECOMMENDATIONS = [
 ];
 
 // --- Operations & email ---
-const OPS_EMAIL = 'conor.bliss.henaghan@gmail.com';
+const OPS_EMAIL = 'your-email@example.com'; // Update with your actual email
 
 // --- Data schema requirements (validation) ---
 const DATA_SCHEMA_REQUIREMENTS = {
