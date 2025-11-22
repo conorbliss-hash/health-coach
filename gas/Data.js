@@ -354,23 +354,71 @@ function stdev_(arr){
 }
 
 // --- Missing-day counters ---
+const ISO_DATE_REGEX = /^\d{4}-\d{2}-\d{2}/;
+const EXCEL_EPOCH = new Date(1899, 11, 30);
+
 function countMissingDaysInWeek_(sheetName){
+  // CRITICAL: Flush to ensure API sees latest changes from Python sync
+  SpreadsheetApp.flush();
+  
   const [start, end] = getWeekBounds_();
   const sh = SpreadsheetApp.getActive().getSheetByName(sheetName);
-  if (!sh) return 7;
+  if (!sh) {
+    Logger.log(`[countMissing] Sheet "${sheetName}" not found`);
+    return 7;
+  }
+  
   const values = sh.getDataRange().getValues();
   const headers = values.shift().map(String);
   const iDate = headers.findIndex(h => h.toLowerCase() === 'date');
   if (iDate === -1) return 7;
+  
   const seen = new Set();
+  const startCalendarDate = startOfDay_(new Date(start));
+  const endCalendarDate = endOfDay_(new Date(end));
+  
   for (const r of values){
-    const d = new Date(r[iDate]);
-    if (!isNaN(d) && d >= start && d <= end){
-      const key = d.getFullYear()+'-'+(d.getMonth()+1)+'-'+d.getDate();
-      seen.add(key);
+    const dateStr = extractDateString_(r[iDate]);
+    if (!dateStr) continue;
+    
+    const localDate = new Date(
+      parseInt(dateStr.slice(0, 4)),
+      parseInt(dateStr.slice(5, 7)) - 1,
+      parseInt(dateStr.slice(8, 10)),
+      0, 0, 0, 0
+    );
+    
+    if (localDate >= startCalendarDate && localDate <= endCalendarDate) {
+      seen.add(dateStr);
     }
   }
+  
   return Math.max(0, 7 - seen.size);
+}
+
+/**
+ * Extract YYYY-MM-DD date string from various formats
+ * Handles: apostrophe-prefixed strings, Date objects, Excel serial numbers
+ */
+function extractDateString_(value) {
+  if (typeof value === 'string') {
+    // Remove leading apostrophe if present (added by gspread to force text storage)
+    const cleaned = value.startsWith("'") ? value.substring(1) : value;
+    return ISO_DATE_REGEX.test(cleaned) ? cleaned.substring(0, 10) : null;
+  }
+  
+  if (value instanceof Date && !isNaN(value)) {
+    // Date object - use Utilities.formatDate for timezone consistency
+    return Utilities.formatDate(value, TZ, 'yyyy-MM-dd');
+  }
+  
+  if (typeof value === 'number') {
+    // Excel serial number
+    const excelDate = new Date(EXCEL_EPOCH.getTime() + value * 86400000);
+    return Utilities.formatDate(excelDate, TZ, 'yyyy-MM-dd');
+  }
+  
+  return null;
 }
 
 // --- Derived stats (delta-first, pre-rounded for display) ---

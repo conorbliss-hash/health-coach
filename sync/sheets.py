@@ -91,13 +91,19 @@ def prepare_dataframe(existing_df: pd.DataFrame, new_df: pd.DataFrame) -> pd.Dat
     # overwritten by incoming NaNs. We run this only when the existing lookup
     # was indexed by `date` (avoids touching weekly rollups).
     if not existing_lookup.empty and not combined.empty and "date" in existing_lookup.index.names:
+        # Remove duplicate dates in existing_lookup (keep first occurrence)
+        existing_lookup = existing_lookup[~existing_lookup.index.duplicated(keep="first")]
         combined_indexed = combined.set_index("date")
         overlapping_cols = set(combined_indexed.columns) & set(existing_lookup.columns)
         for col in overlapping_cols:
-            aligned = existing_lookup[col].reindex(combined_indexed.index)
-            mask = aligned.apply(_should_preserve_existing)
-            if mask.any():
-                combined_indexed.loc[mask, col] = aligned[mask]
+            try:
+                aligned = existing_lookup[col].reindex(combined_indexed.index)
+                mask = aligned.apply(_should_preserve_existing)
+                if mask.any():
+                    combined_indexed.loc[mask, col] = aligned[mask]
+            except Exception:
+                # If reindex fails, skip this column
+                pass
         combined = combined_indexed.reset_index()
 
     sleep_columns = [
@@ -136,6 +142,13 @@ def write_dataframe(
 
     ws.clear()
     values = final_df.where(pd.notna(final_df), None)
+    
+    # Force date column to be stored as text with leading apostrophe
+    # This prevents Google Sheets from auto-parsing dates and causing timezone issues
+    if "date" in values.columns:
+        mask = values["date"].notna()
+        values.loc[mask, "date"] = "'" + values.loc[mask, "date"].astype(str)
+    
     set_with_dataframe(
         ws,
         values,
@@ -145,12 +158,18 @@ def write_dataframe(
     )
 
     if format_sleep:
-        ws.format("B:B", {"numberFormat": {"type": "NUMBER", "pattern": "0"}})
-        ws.format("C:D", {"numberFormat": {"type": "TIME", "pattern": "hh:mm:ss"}})
-        ws.format("E:F", {"numberFormat": {"type": "NUMBER", "pattern": "0"}})
-        ws.format("G:G", {"numberFormat": {"type": "NUMBER", "pattern": "0.0"}})
+        try:
+            ws.format("B:B", {"numberFormat": {"type": "NUMBER", "pattern": "0"}})
+            ws.format("C:D", {"numberFormat": {"type": "TIME", "pattern": "hh:mm:ss"}})
+            ws.format("E:F", {"numberFormat": {"type": "NUMBER", "pattern": "0"}})
+            ws.format("G:G", {"numberFormat": {"type": "NUMBER", "pattern": "0.0"}})
+        except Exception as e:
+            print(f"Warning: Could not apply sleep formatting: {e}")
     elif tab_name == "Activity":
-        ws.format("B:B", {"numberFormat": {"type": "NUMBER", "pattern": "0"}})
-        ws.format("C:C", {"numberFormat": {"type": "NUMBER", "pattern": "0.0"}})
-        ws.format("G:G", {"numberFormat": {"type": "NUMBER", "pattern": "0.0"}})
-        ws.format("H:H", {"numberFormat": {"type": "NUMBER", "pattern": "0"}})
+        try:
+            ws.format("B:B", {"numberFormat": {"type": "NUMBER", "pattern": "0"}})
+            ws.format("C:C", {"numberFormat": {"type": "NUMBER", "pattern": "0.0"}})
+            ws.format("G:G", {"numberFormat": {"type": "NUMBER", "pattern": "0.0"}})
+            ws.format("H:H", {"numberFormat": {"type": "NUMBER", "pattern": "0"}})
+        except Exception as e:
+            print(f"Warning: Could not apply activity formatting: {e}")
