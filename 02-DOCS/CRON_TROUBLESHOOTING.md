@@ -36,7 +36,7 @@ ps aux | grep -i cron | grep -v grep
 
 ```bash
 crontab -l
-# Should show: 0 11 * * * cd "/Users/conorbliss/Desktop/4. HT" && .venv/bin/python 01-CORE/fit_to_sheets.py >> logs/fit_to_sheets.log 2>&1
+# Should show: 0 11 * * * cd "<PROJECT_PATH>" && .venv/bin/python 01-CORE/fit_to_sheets.py >> logs/fit_to_sheets.log 2>&1
 ```
 
 ### Step 3: Cron Will Resume
@@ -104,7 +104,7 @@ Check that cron is working by:
 
 ```bash
 # View recent log entries
-tail -5 "/Users/conorbliss/Desktop/4. HT/logs/fit_to_sheets.log"
+tail -5 "<PROJECT_PATH>/logs/fit_to_sheets.log"
 
 # Should show today's date with successful execution
 ```
@@ -132,7 +132,7 @@ If cron stops again in the future:
 
 4. **Check for errors:**
    ```bash
-   tail -50 "/Users/conorbliss/Desktop/4. HT/logs/fit_to_sheets.log"
+   tail -50 "<PROJECT_PATH>/logs/fit_to_sheets.log"
    ```
 
 ---

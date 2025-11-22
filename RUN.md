@@ -4,8 +4,8 @@
 
 From the project root:
 ```bash
-cd "/Users/conorbliss/Desktop/4. HT/01-CORE"
-"/Users/conorbliss/Desktop/4. HT/.venv/bin/python" fit_to_sheets.py
+cd "<PROJECT_PATH>/01-CORE"
+"<PROJECT_PATH>/.venv/bin/python" fit_to_sheets.py
 ```
 
 Or if you're already in the root directory:

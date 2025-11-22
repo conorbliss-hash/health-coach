@@ -55,7 +55,7 @@ git config user.name "Your Name"
 git config user.email "your.email@example.com"
 
 # Copy all current work here
-cp -r /Users/conorbliss/Desktop/4.\ HT/01-CORE/* .
+cp -r <PROJECT_PATH>/01-CORE/* .
 ```
 
 ### Step 1.2: Create `.gitignore` for Private Repo
