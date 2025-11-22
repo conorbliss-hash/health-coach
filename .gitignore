@@ -35,3 +35,5 @@ exports/
 # OS
 Thumbs.db
 gas/.clasp.json
+*.backup
+*.bak
